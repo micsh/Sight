@@ -262,7 +262,7 @@ let main args =
                         // 3. Source tree (dev mode)
                         Path.Combine(repo, "playbooks")
                     eprintfn "Playbook: %s → dispatching to mini-model..." (Intel.classifyPlaybook query)
-                    let result = Intel.run engine playbooksDir query modulesCache
+                    let result = Intel.run engine playbooksDir query modulesCache |> Async.AwaitTask |> Async.RunSynchronously
                     printfn "%s" result
                     0
             | _ -> 1

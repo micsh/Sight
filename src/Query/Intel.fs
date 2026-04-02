@@ -23,14 +23,13 @@ module Intel =
         if File.Exists path then File.ReadAllText(path) else ""
 
     /// Run code_intel: classify → pick playbook → dispatch to mini-model → return brief.
-    let run (engine: Jint.Engine) (playbooksDir: string) (question: string) (modulesCache: string) =
+    let run (engine: Jint.Engine) (playbooksDir: string) (question: string) (modulesCache: string) = task {
         let playbookId = classifyPlaybook question
         let systemPrompt =
             let path = Path.Combine(playbooksDir, "system-prompt.md")
             if File.Exists path then File.ReadAllText(path) else "You are a code intelligence scout."
         let playbook = loadPlaybook playbooksDir playbookId
 
-        // Build the code_search tool for the mini-agent
         let codeSearchTool = AIFunctionFactory.Create(
             Func<string, string>(fun js ->
                 try QueryEngine.eval engine js
@@ -55,11 +54,12 @@ module Intel =
                 Task.FromResult(PermissionRequestResult(Kind = PermissionRequestResultKind.Approved))))
 
         try
-            let session = client.CreateSessionAsync(config) |> Async.AwaitTask |> Async.RunSynchronously
-            let response = session.SendAndWaitAsync(MessageOptions(Prompt = userMessage), Nullable(TimeSpan.FromMinutes(3.0))) |> Async.AwaitTask |> Async.RunSynchronously
+            let! session = client.CreateSessionAsync(config)
+            let! response = session.SendAndWaitAsync(MessageOptions(Prompt = userMessage), Nullable(TimeSpan.FromMinutes(3.0)))
             let result = response.Data.Content
-            session.DisposeAsync().AsTask().Wait()
-            client.DeleteSessionAsync(sessionId).Wait()
-            result
+            do! session.DisposeAsync().AsTask()
+            do! client.DeleteSessionAsync(sessionId)
+            return result
         with ex ->
-            sprintf "Error running code_intel: %s" ex.Message
+            return sprintf "Error running code_intel: %s" ex.Message
+    }
