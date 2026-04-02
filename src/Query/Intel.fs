@@ -59,6 +59,7 @@ module Intel =
             let response = session.SendAndWaitAsync(MessageOptions(Prompt = userMessage), Nullable(TimeSpan.FromMinutes(3.0))) |> Async.AwaitTask |> Async.RunSynchronously
             let result = response.Data.Content
             session.DisposeAsync().AsTask().Wait()
+            client.DeleteSessionAsync(sessionId).Wait()
             result
         with ex ->
             sprintf "Error running code_intel: %s" ex.Message
