@@ -161,12 +161,19 @@ let main args =
             eprintfn "No index found. Run 'code-sight index' first."
             1
         | Some index ->
-            // Load source chunks for expand/grep/refs
-            let chunks =
+            // Lazy-load source chunks only when needed (expand/grep/refs/neighborhood)
+            let chunksRef = lazy (
                 let allFiles = TreeSitterChunker.findSourceFiles cfg
                 if allFiles.Length > 0 then Some (TreeSitterChunker.chunkFiles cfg allFiles)
-                else None
-            let engine = QueryEngine.create index chunks cfg.EmbeddingUrl
+                else None)
+            // For modules/files/context/impact/imports/deps — no chunks needed
+            // Pass None initially; primitives that need chunks will force the lazy
+            let mutable engine = QueryEngine.create index None cfg.EmbeddingUrl
+            let needsChunks = [| "expand"; "grep"; "refs"; "neighborhood"; "similar" |]
+            let ensureChunks (js: string) =
+                if needsChunks |> Array.exists (fun p -> js.Contains(p)) then
+                    if not chunksRef.IsValueCreated then
+                        engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl
 
             match command with
             | "modules" ->
@@ -177,6 +184,7 @@ let main args =
                     eprintfn "Usage: code-sight search '<js query>'"
                     1
                 else
+                    ensureChunks query
                     printfn "%s" (QueryEngine.eval engine query)
                     0
             | "repl" ->
@@ -185,6 +193,8 @@ let main args =
                 eprintfn "  files(p?), context(file), expand(id), neighborhood(id,opts),"
                 eprintfn "  impact(type), imports(file), deps(pattern), similar(id,opts)"
                 eprintfn ""
+                // Pre-load chunks for repl since user will likely need them
+                engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl
                 let mutable running = true
                 while running do
                     eprintf "> "
