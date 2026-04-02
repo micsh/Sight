@@ -1,0 +1,6 @@
+bin/
+obj/
+.code-intel/
+*.user
+.vs/
+node_modules/
