@@ -83,17 +83,24 @@ let runIndex (cfg: CodeSightConfig) =
         eprintfn "  Changed: %d, Unchanged: %d, Removed: %d" changed.Length unchanged.Length removed.Length
 
         let changedAbs = changed |> Array.map absOf
+        let unchangedSet = Set.ofArray unchanged
 
         // Chunk changed files
         eprintfn "▶ Chunking %d changed files..." changed.Length
         let newChunks = TreeSitterChunker.chunkFiles cfgAll changedAbs
         eprintfn "  %d chunks from changed files" newChunks.Length
 
+        // Load cached source chunks for unchanged files
+        let cachedSourceChunks =
+            match IndexStore.loadSourceChunks cfg.IndexDir with
+            | Some cached -> cached |> Array.filter (fun c -> unchangedSet.Contains c.FilePath)
+            | None -> [||]
+
+        // Merge all source chunks (cached unchanged + new)
+        let allSourceChunks = Array.append cachedSourceChunks newChunks
+
         // Load existing index for unchanged chunks
         let existingIdx = IndexStore.load cfg.IndexDir
-
-        // Merge: keep unchanged chunks, add new
-        let unchangedSet = Set.ofArray unchanged
         let oldChunks =
             match existingIdx with
             | Some idx -> idx.Chunks |> Array.filter (fun c -> unchangedSet.Contains c.FilePath)
@@ -185,6 +192,7 @@ let runIndex (cfg: CodeSightConfig) =
             EmbeddingDim = dim
         }
         IndexStore.save cfg.IndexDir index
+        IndexStore.saveSourceChunks cfg.IndexDir allSourceChunks
         FileHashing.saveHashes hashesPath currentHashes
         eprintfn "✓ Index built: %d chunks, %d imports, %d signatures" finalChunks.Length imports.Length signatures.Length
 
@@ -224,12 +232,18 @@ let main args =
                         CodeEmbeddings = fullIndex.CodeEmbeddings
                         SummaryEmbeddings = fullIndex.SummaryEmbeddings }
 
-            // Lazy-load source chunks
+            // Lazy-load source chunks — try cache first, fall back to re-chunking
             let chunksRef = lazy (
-                let scopeCfg = if scope = "" then cfg else { cfg with SrcDirs = Config.scopeDirs cfg scope }
-                let allFiles = TreeSitterChunker.findSourceFiles scopeCfg
-                if allFiles.Length > 0 then Some (TreeSitterChunker.chunkFiles scopeCfg allFiles)
-                else None)
+                match IndexStore.loadSourceChunks cfg.IndexDir with
+                | Some cached ->
+                    eprintfn "  [loaded %d cached source chunks]" cached.Length
+                    Some cached
+                | None ->
+                    eprintfn "  [no cache — re-chunking source files...]"
+                    let scopeCfg = if scope = "" then cfg else { cfg with SrcDirs = Config.scopeDirs cfg scope }
+                    let allFiles = TreeSitterChunker.findSourceFiles scopeCfg
+                    if allFiles.Length > 0 then Some (TreeSitterChunker.chunkFiles scopeCfg allFiles)
+                    else None)
             // For modules/files/context/impact/imports/deps — no chunks needed
             // Pass None initially; primitives that need chunks will force the lazy
             let mutable engine = QueryEngine.create index None cfg.EmbeddingUrl cfg.IndexDir

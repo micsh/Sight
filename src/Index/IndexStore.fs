@@ -9,6 +9,39 @@ module IndexStore =
 
     let private coreFields = [| "FilePath"; "Module"; "Name"; "Kind"; "StartLine"; "EndLine"; "Summary"; "Signature" |]
 
+    // ── Source chunk cache ──
+
+    let saveSourceChunks (dir: string) (chunks: CodeChunk[]) =
+        let path = Path.Combine(dir, "source-chunks.jsonl")
+        use writer = new StreamWriter(path)
+        for c in chunks do
+            let json = System.Text.Json.JsonSerializer.Serialize({|
+                filePath = c.FilePath; moduleName = c.Module; name = c.Name; kind = c.Kind
+                startLine = c.StartLine; endLine = c.EndLine
+                content = c.Content; context = c.Context |})
+            writer.WriteLine(json)
+        eprintfn "  Cached %d source chunks → source-chunks.jsonl" chunks.Length
+
+    let loadSourceChunks (dir: string) : CodeChunk[] option =
+        let path = Path.Combine(dir, "source-chunks.jsonl")
+        if not (File.Exists path) then None
+        else
+            try
+                let chunks =
+                    File.ReadAllLines(path)
+                    |> Array.choose (fun line ->
+                        try
+                            let doc = System.Text.Json.JsonDocument.Parse(line)
+                            let r = doc.RootElement
+                            let str (p: string) = match r.TryGetProperty(p) with true, v -> v.GetString() | _ -> ""
+                            let int' (p: string) = match r.TryGetProperty(p) with true, v -> v.GetInt32() | _ -> 0
+                            Some { FilePath = str "filePath"; Module = str "moduleName"; Name = str "name"
+                                   Kind = str "kind"; StartLine = int' "startLine"; EndLine = int' "endLine"
+                                   Content = str "content"; Context = str "context" }
+                        with _ -> None)
+                Some chunks
+            with _ -> None
+
     // ── Persistence helpers ──
 
     let private escape (s: string) =
