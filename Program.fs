@@ -233,7 +233,7 @@ let main args =
             // For modules/files/context/impact/imports/deps — no chunks needed
             // Pass None initially; primitives that need chunks will force the lazy
             let mutable engine = QueryEngine.create index None cfg.EmbeddingUrl cfg.IndexDir
-            let needsChunks = [| "expand"; "grep"; "refs"; "neighborhood"; "similar" |]
+            let needsChunks = [| "expand"; "grep"; "refs"; "neighborhood"; "similar"; "walk" |]
             let ensureChunks (js: string) =
                 if needsChunks |> Array.exists (fun p -> js.Contains(p)) then
                     if not chunksRef.IsValueCreated then

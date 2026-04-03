@@ -251,4 +251,45 @@ module Primitives =
                         | _ -> ()
             results.ToArray()
 
+    // ── walk ──
 
+    /// walk(name, {depth, limit}) — recursive reference tracing.
+    /// Chains refs() calls: finds refs of name, then refs of those, up to depth hops.
+    let walk (index: CodeIndex) (session: QuerySession) (chunks: CodeChunk[] option) (startName: string) (maxDepth: int) (limitPerHop: int) =
+        match chunks with
+        | None -> [||]
+        | Some allChunks ->
+            let visited = HashSet<string>()
+            let results = ResizeArray<Dictionary<string, obj>>()
+            let maxResults = maxDepth * limitPerHop * 3
+
+            let rec traceHop (name: string) (depth: int) (trail: string list) =
+                if depth > maxDepth || visited.Contains(name) || results.Count >= maxResults then ()
+                else
+                    visited.Add(name) |> ignore
+                    // Reuse refs logic directly
+                    let regex = Regex(sprintf @"\b%s\b" (Regex.Escape name), RegexOptions.Compiled)
+                    let mutable hitCount = 0
+                    for i in 0..index.Chunks.Length-1 do
+                        if hitCount < limitPerHop && results.Count < maxResults then
+                            let c = index.Chunks.[i]
+                            if c.Name <> name then
+                                match findSource (Some allChunks) c with
+                                | Some ch when regex.IsMatch(ch.Content) ->
+                                    let matchLine = ch.Content.Split('\n') |> Array.tryFind (fun l -> regex.IsMatch(l)) |> Option.map (fun l -> l.Trim()) |> Option.defaultValue ""
+                                    let currentTrail = trail @ [sprintf "%s (%s:%d)" c.Name (Path.GetFileName c.FilePath) c.StartLine]
+                                    let id = session.NextRef(i)
+                                    results.Add(mdict [
+                                        "id", box id; "hop", box depth; "name", box c.Name
+                                        "file", box (Path.GetFileName c.FilePath); "line", box c.StartLine
+                                        "matchLine", box matchLine; "trail", box (currentTrail |> String.concat " → ")
+                                    ])
+                                    hitCount <- hitCount + 1
+                                    // Next hop: use the chunk's short name
+                                    let nextName = c.Name.Split('.') |> Array.last
+                                    if nextName.Length > 2 && not (nextName.Contains("_part")) then
+                                        traceHop nextName (depth + 1) currentTrail
+                                | _ -> ()
+
+            traceHop startName 1 [startName]
+            results.ToArray()

@@ -87,6 +87,17 @@ module QueryEngine =
                 | _ -> 20
             box (Primitives.refs index session chunks name limit))) |> ignore
 
+        // walk
+        engine.SetValue("walk", Func<string, obj, obj>(fun name opts ->
+            let depth, limit =
+                match opts with
+                | :? Jint.Native.JsObject as o ->
+                    let d = match o.Get("depth") with v when not (v.IsUndefined()) -> int (v.AsNumber()) | _ -> 2
+                    let l = match o.Get("limit") with v when not (v.IsUndefined()) -> int (v.AsNumber()) | _ -> 5
+                    d, l
+                | _ -> 2, 5
+            box (Primitives.walk index session chunks name depth limit))) |> ignore
+
         engine
 
     /// Evaluate JS with IIFE wrapping (avoids let-redeclaration across calls).
