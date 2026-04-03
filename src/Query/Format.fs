@@ -90,7 +90,11 @@ module Format =
                 else
                     // Unknown dict shape — serialize as key: value pairs
                     for kv in d do
-                        let valStr = formatValue kv.Value
+                        let valStr =
+                            try
+                                let f = System.Convert.ToDouble(kv.Value)
+                                sprintf "%g" f
+                            with _ -> formatValue kv.Value
                         lines.Add(sprintf "%s: %s" kv.Key valStr)
 
                 match d.TryGetValue("imports") with | true, (:? (string[]) as imps) when imps.Length > 0 -> lines.Add(sprintf "Imports: %s" (imps |> String.concat ", ")) | _ -> ()
@@ -148,7 +152,8 @@ module Format =
         | null -> "(no results)"
         | :? string as s -> s
         | :? int as i -> string i
-        | :? float as f -> sprintf "%.3f" f
+        | :? float as f -> if f = System.Math.Floor(f) && abs f < 1e15 then sprintf "%.0f" f else sprintf "%.3f" f
+        | :? System.Double as f -> if f = System.Math.Floor(f) && abs f < 1e15 then sprintf "%.0f" f else sprintf "%.3f" f
         | :? bool as b -> if b then "true" else "false"
         | other ->
             // Fallback: try JSON serialization for unknown types
