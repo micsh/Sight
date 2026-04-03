@@ -31,27 +31,6 @@ similar(id, {limit})                → same as search
 
 Results carry ref IDs (R1, R2...) — use them with expand/neighborhood.
 
-## Important: output is auto-formatted
-
-The tool automatically formats all return values — objects, arrays, strings, numbers. You do **NOT** need `JSON.stringify`. Just return the value directly:
-
-```js
-// WRONG — don't use JSON.stringify
-JSON.stringify(modules())
-
-// RIGHT — just return the expression
-modules()
-```
-
-For combined queries, return an object literal wrapped in parentheses:
-
-```js
-// RIGHT — object with multiple results
-let m = modules();
-let r = refs("MyType", {limit:10});
-({moduleCount: m.length, refCount: r.length, topRefs: r.slice(0,3)})
-```
-
 ## Efficient querying
 
 Combine multiple queries in one code_search call using JavaScript:
@@ -62,7 +41,7 @@ code_search('modules()')
 code_search('context("File.fs")')
 code_search('refs("MyType", {limit:10})')
 
-// Good: combine in one call
+// Good: combine in one call, return an object
 code_search(`
   let m = modules();
   let ctx = context("File.fs");
@@ -88,3 +67,4 @@ code_search(`
 - **Ref IDs** the calling agent can expand
 
 Under 400 words. Use actual names from results. Skip boilerplate.
+
