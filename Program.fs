@@ -7,6 +7,7 @@ let printUsage () =
     eprintfn ""
     eprintfn "Usage:"
     eprintfn "  code-sight index [--repo <path>]                     Build/update index"
+    eprintfn "  code-sight index --files <f1> <f2> ... [--repo <path>] Re-index specific files"
     eprintfn "  code-sight modules [--repo <path>]                   Show project map"
     eprintfn "  code-sight search <js> [--repo <path>] [--scope <s>] Run a query"
     eprintfn "  code-sight intel <question> [--repo <path>]          Ask about the codebase"
@@ -19,6 +20,7 @@ let parseArgs (args: string[]) =
     let mutable command = ""
     let mutable query = ""
     let mutable scope = ""
+    let files = ResizeArray<string>()
     let mutable i = 0
     while i < args.Length do
         match args.[i] with
@@ -28,6 +30,11 @@ let parseArgs (args: string[]) =
         | "--scope" when i + 1 < args.Length ->
             scope <- args.[i + 1]
             i <- i + 2
+        | "--files" ->
+            i <- i + 1
+            while i < args.Length && not (args.[i].StartsWith("--")) do
+                files.Add(args.[i])
+                i <- i + 1
         | "index" | "modules" | "repl" | "scopes" ->
             command <- args.[i]
             i <- i + 1
@@ -50,7 +57,7 @@ let parseArgs (args: string[]) =
             query <- arg
             i <- i + 1
         | _ -> i <- i + 1
-    repo, command, query, scope
+    repo, command, query, scope, files.ToArray()
 
 let runIndex (cfg: CodeSightConfig) =
     let hashesPath = Path.Combine(cfg.IndexDir, "hashes.json")
@@ -196,14 +203,169 @@ let runIndex (cfg: CodeSightConfig) =
         FileHashing.saveHashes hashesPath currentHashes
         eprintfn "✓ Index built: %d chunks, %d imports, %d signatures" finalChunks.Length imports.Length signatures.Length
 
+/// Re-index only the specified files, merging with cached index for everything else.
+let runIndexFiles (cfg: CodeSightConfig) (files: string[]) =
+    let hashesPath = Path.Combine(cfg.IndexDir, "hashes.json")
+    Directory.CreateDirectory(cfg.IndexDir) |> ignore
+
+    let allDirs = cfg.Scopes |> Array.collect (fun s -> s.Dirs) |> Array.distinct
+    let cfgAll = { cfg with SrcDirs = allDirs }
+
+    // Resolve files to absolute + relative paths
+    let resolvedFiles =
+        files |> Array.choose (fun f ->
+            let abs =
+                if Path.IsPathRooted f then f
+                else Path.GetFullPath(Path.Combine(cfg.RepoRoot, f))
+            if File.Exists abs then
+                let rel = Path.GetRelativePath(cfg.RepoRoot, abs).Replace("\\", "/")
+                Some (rel, abs)
+            else
+                eprintfn "  Warning: file not found, skipping: %s" f
+                None)
+
+    if resolvedFiles.Length = 0 then
+        eprintfn "No valid files to index."
+    else
+        let changedRel = resolvedFiles |> Array.map fst
+        let changedAbs = resolvedFiles |> Array.map snd
+        let changedSet = Set.ofArray changedRel
+
+        eprintfn "▶ Re-indexing %d files..." resolvedFiles.Length
+        for rel, _ in resolvedFiles do eprintfn "  %s" rel
+
+        // Everything NOT in the changed set is unchanged
+        let oldHashes = FileHashing.loadHashes hashesPath
+        let unchangedSet =
+            oldHashes |> Map.toArray
+            |> Array.filter (fun (f, _) -> not (changedSet.Contains f))
+            |> Array.map fst |> Set.ofArray
+
+        // Chunk changed files
+        eprintfn "▶ Chunking %d files..." changedAbs.Length
+        let newChunks = TreeSitterChunker.chunkFiles cfgAll changedAbs
+        eprintfn "  %d chunks from changed files" newChunks.Length
+
+        // Load cached source chunks for unchanged files
+        let cachedSourceChunks =
+            match IndexStore.loadSourceChunks cfg.IndexDir with
+            | Some cached -> cached |> Array.filter (fun c -> unchangedSet.Contains c.FilePath)
+            | None -> [||]
+        let allSourceChunks = Array.append cachedSourceChunks newChunks
+
+        // Load existing index for unchanged chunks
+        let existingIdx = IndexStore.load cfg.IndexDir
+        let oldChunks =
+            match existingIdx with
+            | Some idx -> idx.Chunks |> Array.filter (fun c -> unchangedSet.Contains c.FilePath)
+            | None -> [||]
+        let allChunkEntries =
+            let newEntries = newChunks |> Array.map (fun c ->
+                { FilePath = c.FilePath; Module = c.Module; Name = c.Name; Kind = c.Kind
+                  StartLine = c.StartLine; EndLine = c.EndLine; Summary = ""; Signature = ""; Extra = Map.empty })
+            Array.append oldChunks newEntries
+
+        // Imports and signatures (only re-extract for changed files, keep cached for rest)
+        let allFilesAbs =
+            let cachedFiles = unchangedSet |> Set.toArray |> Array.map (fun rel -> Path.GetFullPath(Path.Combine(cfg.RepoRoot, rel)))
+            Array.append cachedFiles changedAbs
+
+        eprintfn "▶ Extracting imports..."
+        let imports = TreeSitterChunker.extractImports cfgAll allFilesAbs |> Array.map (fun i -> i.FilePath, i.Module)
+        eprintfn "  %d import edges" imports.Length
+
+        eprintfn "▶ Extracting signatures..."
+        let signatures = TreeSitterChunker.extractSignatures cfgAll allFilesAbs
+        eprintfn "  %d signatures" signatures.Length
+
+        eprintfn "▶ Extracting type refs..."
+        let typeRefs = TreeSitterChunker.extractTypeRefs cfgAll allFilesAbs |> Array.map (fun r -> r.FilePath, r.TypeRefs)
+        eprintfn "  %d files with type refs" typeRefs.Length
+
+        // Match signatures to chunks
+        let sigLookup = signatures |> Array.map (fun s -> (s.FilePath, s.Name, s.StartLine), s.Signature) |> dict
+        let finalChunks =
+            allChunkEntries |> Array.map (fun c ->
+                let sig' =
+                    match sigLookup.TryGetValue((c.FilePath, c.Name, c.StartLine)) with
+                    | true, v -> v
+                    | _ ->
+                        let shortName = c.Name.Split('.') |> Array.last
+                        match sigLookup.TryGetValue((c.FilePath, shortName, c.StartLine)) with
+                        | true, v -> v | _ -> c.Signature
+                if sig' <> "" then { c with Signature = sig' } else c)
+
+        // Embeddings: keep old for unchanged, compute new
+        let newChunkCount = finalChunks.Length - oldChunks.Length
+        eprintfn "▶ Computing embeddings for %d new chunks..." newChunkCount
+
+        let newChunkTexts =
+            finalChunks.[oldChunks.Length..]
+            |> Array.map (fun c ->
+                let context = if c.Module <> "" then sprintf "%s\n%s:%s" c.Module c.Kind c.Name else sprintf "%s:%s" c.Kind c.Name
+                sprintf "%s\n%s" context (match newChunks |> Array.tryFind (fun ch -> ch.FilePath = c.FilePath && ch.Name = c.Name && ch.StartLine = c.StartLine) with Some ch -> ch.Content | None -> c.Name))
+
+        let embedBatch (texts: string[]) =
+            if texts.Length = 0 then [||]
+            else
+                let results = ResizeArray()
+                for batch in texts |> Array.chunkBySize cfg.EmbeddingBatchSize do
+                    match EmbeddingService.embed cfg.EmbeddingUrl batch |> Async.AwaitTask |> Async.RunSynchronously with
+                    | Some embs -> results.AddRange(embs)
+                    | None ->
+                        eprintfn "  Warning: embedding server unavailable — storing empty embeddings"
+                        results.AddRange(Array.init batch.Length (fun _ -> [||]))
+                results.ToArray()
+
+        let newCodeEmbs = embedBatch newChunkTexts
+        let codeEmbs =
+            match existingIdx with
+            | Some idx when idx.CodeEmbeddings.Length = oldChunks.Length ->
+                Array.append idx.CodeEmbeddings newCodeEmbs
+            | _ -> embedBatch (finalChunks |> Array.map (fun c -> sprintf "%s:%s %s" c.Kind c.Name c.Summary))
+
+        let newSumTexts = finalChunks.[oldChunks.Length..] |> Array.map (fun c -> if c.Summary <> "" then c.Summary else sprintf "%s %s" c.Kind c.Name)
+        let newSumEmbs = embedBatch newSumTexts
+        let sumEmbs =
+            match existingIdx with
+            | Some idx when idx.SummaryEmbeddings.Length = oldChunks.Length ->
+                Array.append idx.SummaryEmbeddings newSumEmbs
+            | _ -> embedBatch (finalChunks |> Array.map (fun c -> if c.Summary <> "" then c.Summary else sprintf "%s %s" c.Kind c.Name))
+
+        if codeEmbs.Length > 0 && codeEmbs.[0].Length > 0 then
+            eprintfn "  %d embeddings (%d dimensions)" codeEmbs.Length codeEmbs.[0].Length
+
+        let dim = if codeEmbs.Length > 0 && codeEmbs.[0].Length > 0 then codeEmbs.[0].Length else 0
+
+        let index : CodeIndex = {
+            Chunks = finalChunks
+            CodeEmbeddings = codeEmbs
+            SummaryEmbeddings = sumEmbs
+            Imports = imports
+            TypeRefs = typeRefs
+            EmbeddingDim = dim
+        }
+        IndexStore.save cfg.IndexDir index
+        IndexStore.saveSourceChunks cfg.IndexDir allSourceChunks
+
+        // Update hashes only for the changed files
+        let updatedHashes =
+            oldHashes
+            |> Map.toArray |> Array.filter (fun (f, _) -> not (changedSet.Contains f))
+            |> Array.append (resolvedFiles |> Array.map (fun (rel, abs) -> rel, FileHashing.hashFile abs))
+            |> Map.ofArray
+        FileHashing.saveHashes hashesPath updatedHashes
+        eprintfn "✓ Index updated: %d chunks, %d imports, %d signatures" finalChunks.Length imports.Length signatures.Length
+
 [<EntryPoint>]
 let main args =
-    let repo, command, query, scope = parseArgs args
+    let repo, command, query, scope, files = parseArgs args
 
     match command with
     | "index" ->
         let cfg = Config.load repo
-        runIndex cfg
+        if files.Length > 0 then runIndexFiles cfg files
+        else runIndex cfg
         0
     | "scopes" ->
         let cfg = Config.load repo
