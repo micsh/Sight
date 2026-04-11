@@ -7,6 +7,16 @@ open System.Text.Json
 /// Result formatting for LLM consumption.
 module Format =
 
+    let private sourceKey = "__cs_source__"
+
+    let private fmtScore (d: IDictionary<string, obj>) =
+        match d.TryGetValue("score") with
+        | true, v ->
+            match v with
+            | :? float as f -> sprintf "%.2f  " f
+            | _ -> try sprintf "%.2f  " (System.Convert.ToDouble(v)) with _ -> ""
+        | _ -> ""
+
     /// Convert ExpandoObject (and nested ones) to IDictionary for uniform handling.
     let rec private normalize (v: obj) : obj =
         match v with
@@ -75,7 +85,7 @@ module Format =
                 let name = match d.TryGetValue("name") with true, v -> string v | _ -> ""
                 let file = match d.TryGetValue("file") with true, v -> string v | _ -> ""
                 let line = match d.TryGetValue("line") with true, v -> string v | _ -> ""
-                let score = match d.TryGetValue("score") with true, v -> sprintf "%.2f  " (unbox<float> v) | _ -> ""
+                let score = fmtScore d
                 let summary = match d.TryGetValue("summary") with true, v -> string v | _ -> ""
                 let sigStr = match d.TryGetValue("signature") with true, v when string v <> "" -> sprintf "\n       %s" (string v) | _ -> ""
                 let code = match d.TryGetValue("code") with true, v -> string v | _ -> ""
@@ -88,14 +98,14 @@ module Format =
                 elif id <> "" then
                     lines.Add(sprintf "[%s] %s%s:%s (%s:%s)%s\n       %s%s%s" id score kind name file line sigStr summary matchLine preview)
                 else
-                    // Unknown dict shape — serialize as key: value pairs
                     for kv in d do
-                        let valStr =
-                            try
-                                let f = System.Convert.ToDouble(kv.Value)
-                                sprintf "%g" f
-                            with _ -> formatValue kv.Value
-                        lines.Add(sprintf "%s: %s" kv.Key valStr)
+                        if kv.Key <> sourceKey then
+                            let valStr =
+                                try
+                                    let f = System.Convert.ToDouble(kv.Value)
+                                    sprintf "%g" f
+                                with _ -> formatValue kv.Value
+                            lines.Add(sprintf "%s: %s" kv.Key valStr)
 
                 match d.TryGetValue("imports") with | true, (:? (string[]) as imps) when imps.Length > 0 -> lines.Add(sprintf "Imports: %s" (imps |> String.concat ", ")) | _ -> ()
                 match d.TryGetValue("dependents") with | true, (:? (string[]) as deps) when deps.Length > 0 -> lines.Add(sprintf "Dependents: %s" (deps |> String.concat ", ")) | _ -> ()
@@ -134,7 +144,7 @@ module Format =
                 let name = match d.TryGetValue("name") with true, v -> string v | _ -> ""
                 let file = match d.TryGetValue("file") with true, v -> string v | _ -> ""
                 let line = match d.TryGetValue("line") with true, v -> string v | _ -> ""
-                let score = match d.TryGetValue("score") with true, v -> sprintf "%.2f  " (unbox<float> v) | _ -> ""
+                let score = fmtScore d
                 let summary = match d.TryGetValue("summary") with true, v -> string v | _ -> ""
                 let sigStr = match d.TryGetValue("signature") with true, v when string v <> "" -> sprintf "\n       %s" (string v) | _ -> ""
                 let matchLine = match d.TryGetValue("matchLine") with true, v when string v <> "" -> sprintf "\n       ▸ %s" (string v) | _ -> ""
@@ -142,8 +152,8 @@ module Format =
                 if id <> "" then sprintf "[%s] %s%s:%s (%s:%s)%s\n       %s%s%s" id score kind name file line sigStr summary matchLine preview
                 elif file <> "" then sprintf "%s — %s" file summary
                 else
-                    // Unknown dict in array — format as key:value
-                    d |> Seq.map (fun kv -> sprintf "%s=%s" kv.Key (formatValue kv.Value)) |> String.concat ", " |> sprintf "{%s}")
+                    d |> Seq.filter (fun kv -> kv.Key <> sourceKey)
+                    |> Seq.map (fun kv -> sprintf "%s=%s" kv.Key (formatValue kv.Value)) |> String.concat ", " |> sprintf "{%s}")
             |> String.concat "\n"
 
         | :? (obj[]) as arr when arr.Length > 0 && (arr.[0] :? string) -> arr |> Array.map string |> String.concat "\n"

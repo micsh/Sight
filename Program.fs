@@ -3,23 +3,67 @@ open System.IO
 open AITeam.CodeSight
 
 let printUsage () =
-    eprintfn "AITeam.CodeSight — code intelligence for any codebase"
-    eprintfn ""
-    eprintfn "Usage:"
-    eprintfn "  code-sight index [--repo <path>]                     Build/update index"
-    eprintfn "  code-sight index --files <f1> <f2> ... [--repo <path>] Re-index specific files"
-    eprintfn "  code-sight modules [--repo <path>]                   Show project map"
-    eprintfn "  code-sight search <js> [--repo <path>] [--scope <s>] Run a query"
-    eprintfn "  code-sight intel <question> [--repo <path>]          Ask about the codebase"
-    eprintfn "  code-sight repl [--repo <path>] [--scope <s>]        Interactive mode"
-    eprintfn "  code-sight scopes [--repo <path>]                    List available scopes"
-    eprintfn ""
+    printfn "AITeam.CodeSight — code intelligence for any codebase"
+    printfn ""
+    printfn "Usage:"
+    printfn "  code-sight index [--repo <path>]                     Build/update index"
+    printfn "  code-sight index --files <f1> <f2> ... [--repo <path>] Re-index specific files"
+    printfn "  code-sight modules [--repo <path>]                   Show project map"
+    printfn "  code-sight search <js> [--repo <path>] [--scope <s>] Run a query"
+    printfn "  code-sight eval <js> [--repo <path>]                 Alias for search"
+    printfn "  code-sight intel <question> [--repo <path>]          Ask about the codebase"
+    printfn "  code-sight repl [--repo <path>] [--scope <s>]        Interactive mode"
+    printfn "  code-sight scopes [--repo <path>]                    List available scopes"
+    printfn "  code-sight fn add <name> <body> [options]            Define a reusable function"
+    printfn "  code-sight fn list [--verbose] [--json]              List saved functions"
+    printfn "  code-sight fn rm <name> [--repo <path>]              Remove a function"
+    printfn "  code-sight --help                                    Show this help"
+    printfn ""
+    printfn "Functions:"
+    printfn "  Save chains of primitives as reusable functions. Example:"
+    printfn "    code-sight fn add deepSearch --params \"q\" \"search(q).concat(similar(search(q)[0]))\""
+    printfn "    code-sight search \"deepSearch('auth')\""
+    printfn ""
+    printfn "  Options for 'fn add':"
+    printfn "    --params \"a,b\"          Comma-separated parameter names"
+    printfn "    --desc \"description\"    Optional description"
+    printfn "    --file <path>           Read function body from a file"
+    printfn ""
+    printfn "Primitives (available in search expressions):"
+    printfn "  search(query, {limit, kind, file})  Semantic search across indexed chunks"
+    printfn "  modules()                           Project map — directories, symbols, imports"
+    printfn "  context(file)                       File outline with types, functions, imports"
+    printfn "  expand(refId)                       Expand R# ref to full source content"
+    printfn "  neighborhood(refId, {before, after}) Surrounding symbols in the same file"
+    printfn "  similar(refId, {limit})              Semantically similar chunks"
+    printfn "  grep(pattern, {limit, kind, file})   Regex search over source content"
+    printfn "  files(pattern)                       List indexed source files"
+    printfn "  impact(type)                         Find all references to a type"
+    printfn "  imports(file)                        Show what a file imports"
+    printfn "  deps(pattern)                        Show dependency graph for a module"
+    printfn "  refs(name, {limit})                  Find all references to a symbol"
+    printfn "  walk(name, {depth, limit})           Walk the dependency graph from a symbol"
+    printfn ""
+    printfn "Composition helpers:"
+    printfn "  pipe(value, fn1, fn2, ...)           Thread value through functions"
+    printfn "  tap(value, fn)                       Run fn for side-effects, return value"
+    printfn "  mergeBy(key, arr1, arr2, ...)        Union arrays with dedup by key"
+    printfn "  print(value)                         Debug output to stderr"
+    printfn ""
+    printfn "Note: UDFs are available in search/eval and intel. Intel auto-discovers UDFs."
+    printfn ""
 
 let parseArgs (args: string[]) =
     let mutable repo = Environment.CurrentDirectory
     let mutable command = ""
     let mutable query = ""
     let mutable scope = ""
+    let mutable fnName = ""
+    let mutable fnParams = ""
+    let mutable fnDesc = ""
+    let mutable fnFile = ""
+    let mutable verbose = false
+    let mutable jsonOut = false
     let files = ResizeArray<string>()
     let mutable i = 0
     while i < args.Length do
@@ -30,6 +74,9 @@ let parseArgs (args: string[]) =
         | "--scope" when i + 1 < args.Length ->
             scope <- args.[i + 1]
             i <- i + 2
+        | "--help" | "-h" ->
+            command <- "help"
+            i <- i + 1
         | "--files" ->
             i <- i + 1
             while i < args.Length && not (args.[i].StartsWith("--")) do
@@ -38,6 +85,46 @@ let parseArgs (args: string[]) =
         | "index" | "modules" | "repl" | "scopes" ->
             command <- args.[i]
             i <- i + 1
+        | "fn" when i + 1 < args.Length ->
+            match args.[i + 1] with
+            | "add" when i + 2 < args.Length ->
+                command <- "fn-add"
+                fnName <- args.[i + 2]
+                i <- i + 3
+                while i < args.Length do
+                    match args.[i] with
+                    | "--params" when i + 1 < args.Length ->
+                        fnParams <- args.[i + 1]
+                        i <- i + 2
+                    | "--desc" when i + 1 < args.Length ->
+                        fnDesc <- args.[i + 1]
+                        i <- i + 2
+                    | "--file" when i + 1 < args.Length ->
+                        fnFile <- args.[i + 1]
+                        i <- i + 2
+                    | "--repo" when i + 1 < args.Length ->
+                        repo <- args.[i + 1]
+                        i <- i + 2
+                    | _ when query = "" ->
+                        query <- args.[i]
+                        i <- i + 1
+                    | _ -> i <- i + 1
+            | "list" ->
+                command <- "fn-list"
+                i <- i + 2
+                while i < args.Length do
+                    match args.[i] with
+                    | "--verbose" | "-v" -> verbose <- true; i <- i + 1
+                    | "--json" -> jsonOut <- true; i <- i + 1
+                    | "--repo" when i + 1 < args.Length -> repo <- args.[i + 1]; i <- i + 2
+                    | _ -> i <- i + 1
+            | "rm" when i + 2 < args.Length ->
+                command <- "fn-rm"
+                fnName <- args.[i + 2]
+                i <- i + 3
+            | _ ->
+                command <- "fn-list"
+                i <- i + 2
         | "intel" when i + 1 < args.Length ->
             command <- "intel"
             query <- args.[i + 1]
@@ -45,11 +132,11 @@ let parseArgs (args: string[]) =
         | "intel" ->
             command <- "intel"
             i <- i + 1
-        | "search" when i + 1 < args.Length ->
+        | "search" | "eval" when i + 1 < args.Length ->
             command <- "search"
             query <- args.[i + 1]
             i <- i + 2
-        | "search" ->
+        | "search" | "eval" ->
             command <- "search"
             i <- i + 1
         | arg when command = "" ->
@@ -57,7 +144,7 @@ let parseArgs (args: string[]) =
             query <- arg
             i <- i + 1
         | _ -> i <- i + 1
-    repo, command, query, scope, files.ToArray()
+    repo, command, query, scope, files.ToArray(), fnName, fnParams, fnDesc, fnFile, verbose, jsonOut
 
 let runIndex (cfg: CodeSightConfig) =
     let hashesPath = Path.Combine(cfg.IndexDir, "hashes.json")
@@ -359,9 +446,60 @@ let runIndexFiles (cfg: CodeSightConfig) (files: string[]) =
 
 [<EntryPoint>]
 let main args =
-    let repo, command, query, scope, files = parseArgs args
+    let repo, command, query, scope, files, fnName, fnParams, fnDesc, fnFile, verbose, jsonOut = parseArgs args
 
     match command with
+    | "help" ->
+        printUsage()
+        0
+    | "fn-add" ->
+        let body =
+            if fnFile <> "" then
+                let path = if File.Exists fnFile then fnFile else Path.Combine(repo, fnFile)
+                if File.Exists path then File.ReadAllText(path)
+                else eprintfn "File not found: %s" fnFile; ""
+            else query
+        if body = "" then
+            eprintfn "No function body provided. Pass it as an argument or use --file <path>."
+            1
+        else
+            let ps = if fnParams = "" then [||] else fnParams.Split(',') |> Array.map (fun s -> s.Trim())
+            let fn = { Name = fnName; Params = ps; Body = body; Description = fnDesc }
+            match FunctionStore.add repo fn with
+            | Ok msg -> printfn "%s" msg; 0
+            | Error msg -> eprintfn "Error: %s" msg; 1
+    | "fn-list" ->
+        let fns = FunctionStore.load repo
+        if fns.Length = 0 then
+            if jsonOut then printfn "[]"
+            else printfn "No functions defined. Use 'code-sight fn add <name> <body>' to create one."
+        elif jsonOut then
+            let options = System.Text.Json.JsonSerializerOptions(WriteIndented = true)
+            let arr = fns |> Array.map (fun f ->
+                dict [ "name", box f.Name; "params", box f.Params; "body", box f.Body; "description", box f.Description ])
+            printfn "%s" (System.Text.Json.JsonSerializer.Serialize(arr, options))
+        elif verbose then
+            printfn "%d function(s) in %s:" fns.Length repo
+            printfn ""
+            for f in fns do
+                let joined = f.Params |> String.concat ", "
+                let ps = if f.Params.Length = 0 then "()" else sprintf "(%s)" joined
+                printfn "  %s%s" f.Name ps
+                if f.Description <> "" then printfn "    %s" f.Description
+                printfn "    body: %s" f.Body
+                printfn ""
+        else
+            printfn "%d function(s):" fns.Length
+            for f in fns do
+                let joined = f.Params |> String.concat ", "
+                let ps = if f.Params.Length = 0 then "()" else sprintf "(%s)" joined
+                let desc = if f.Description <> "" then sprintf " — %s" f.Description else ""
+                printfn "  %s%s%s" f.Name ps desc
+        0
+    | "fn-rm" ->
+        match FunctionStore.remove repo fnName with
+        | Ok msg -> printfn "%s" msg; 0
+        | Error msg -> eprintfn "Error: %s" msg; 1
     | "index" ->
         let cfg = Config.load repo
         if files.Length > 0 then runIndexFiles cfg files
@@ -408,12 +546,12 @@ let main args =
                     else None)
             // For modules/files/context/impact/imports/deps — no chunks needed
             // Pass None initially; primitives that need chunks will force the lazy
-            let mutable engine = QueryEngine.create index None cfg.EmbeddingUrl cfg.IndexDir
+            let mutable engine = QueryEngine.create index None cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot
             let needsChunks = [| "expand"; "grep"; "refs"; "neighborhood"; "similar"; "walk" |]
             let ensureChunks (js: string) =
                 if needsChunks |> Array.exists (fun p -> js.Contains(p)) then
                     if not chunksRef.IsValueCreated then
-                        engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir
+                        engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot
 
             match command with
             | "modules" ->
@@ -434,7 +572,7 @@ let main args =
                 eprintfn "  impact(type), imports(file), deps(pattern), similar(id,opts)"
                 eprintfn ""
                 // Pre-load chunks for repl since user will likely need them
-                engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir
+                engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot
                 let mutable running = true
                 while running do
                     eprintf "> "
@@ -451,8 +589,8 @@ let main args =
                     1
                 else
                     // Ensure chunks loaded for the mini-agent's code_search calls
-                    engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir
-                    let modulesCache = QueryEngine.eval engine "modules()"
+                    engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot
+                    let modulesCache= QueryEngine.eval engine "modules()"
                     let playbooksDir =
                         // 1. Per-repo override
                         let repoPlaybooks = Path.Combine(repo, ".code-intel", "playbooks")
@@ -465,7 +603,19 @@ let main args =
                         // 3. Source tree (dev mode)
                         Path.Combine(repo, "playbooks")
                     eprintfn "Dispatching to mini-model..."
-                    let result = Intel.run engine playbooksDir query modulesCache |> Async.AwaitTask |> Async.RunSynchronously
+                    // Build UDF signatures for the AI tool description
+                    let userFns = FunctionStore.load repo
+                    let udfSigs =
+                        if userFns.Length = 0 then ""
+                        else
+                            userFns
+                            |> Array.truncate 15
+                            |> Array.map (fun f ->
+                                let ps = if f.Params.Length = 0 then "()" else sprintf "(%s)" (f.Params |> String.concat ",")
+                                let desc = if f.Description <> "" then sprintf " — %s" f.Description else ""
+                                sprintf "%s%s%s" f.Name ps desc)
+                            |> String.concat "; "
+                    let result = Intel.run engine playbooksDir query modulesCache udfSigs |> Async.AwaitTask |> Async.RunSynchronously
                     printfn "%s" result
                     0
             | _ -> 1

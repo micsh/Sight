@@ -19,19 +19,21 @@ module Intel =
         else [||]
 
     /// Run code_intel: give mini-model tools and let it pick the right playbook.
-    let run (engine: Jint.Engine) (playbooksDir: string) (question: string) (modulesCache: string) = task {
+    let run (engine: Jint.Engine) (playbooksDir: string) (question: string) (modulesCache: string) (udfSignatures: string) = task {
         let systemPrompt =
             let path = Path.Combine(playbooksDir, "system-prompt.md")
             if File.Exists path then File.ReadAllText(path) else "You are a code intelligence scout."
 
         let available = listPlaybooks playbooksDir
 
+        let baseDesc = "Query the code index. Functions: search(q,opts), refs(name,opts), grep(pattern,opts), modules(), files(p?), context(file), expand(id), neighborhood(id,opts), impact(type), imports(file), deps(pattern), similar(id,opts), walk(name,opts). Start with modules() for overview."
+        let toolDesc = if udfSignatures <> "" then sprintf "%s User-defined functions: %s" baseDesc udfSignatures else baseDesc
         let codeSearchTool = AIFunctionFactory.Create(
             Func<string, string>(fun js ->
                 try QueryEngine.eval engine js
                 with ex -> sprintf "Error: %s" ex.Message),
             "code_search",
-            "Query the code index. Functions: search(q,opts), refs(name,opts), grep(pattern,opts), modules(), files(p?), context(file), expand(id), neighborhood(id,opts), impact(type), imports(file), deps(pattern), similar(id,opts). Start with modules() for overview.")
+            toolDesc)
 
         let playbookDescriptions = [
             "orient (what is this codebase?)"

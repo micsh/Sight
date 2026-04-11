@@ -8,8 +8,18 @@ open Jint
 /// Jint-based query engine. Wires all 12 primitives, evaluates JS, formats results.
 module QueryEngine =
 
+    let private sourceKey = "__cs_source__"
+
+    let private stamp (source: string) (results: Dictionary<string, obj>[]) =
+        for d in results do d.[sourceKey] <- box source
+        results
+
+    let private stamp1 (source: string) (result: Dictionary<string, obj>) =
+        result.[sourceKey] <- box source
+        result
+
     /// Create a Jint engine with all primitives wired.
-    let create (index: CodeIndex) (chunks: CodeChunk[] option) (embeddingUrl: string) (indexDir: string) =
+    let create (index: CodeIndex) (chunks: CodeChunk[] option) (embeddingUrl: string) (indexDir: string) (repoRoot: string) =
         let session = QuerySession(indexDir)
         let engine = Engine()
 
@@ -23,22 +33,22 @@ module QueryEngine =
                     let f = match o.Get("file") with v when not (v.IsUndefined()) && not (v.IsNull()) -> v.AsString() | _ -> ""
                     l, k, f
                 | _ -> 5, "", ""
-            box (Primitives.search index session chunks embeddingUrl query limit kind file))) |> ignore
+            box (stamp "search" (Primitives.search index session chunks embeddingUrl query limit kind file)))) |> ignore
 
         // context
-        engine.SetValue("context", Func<string, obj>(fun f -> box (Primitives.context index session f))) |> ignore
+        engine.SetValue("context", Func<string, obj>(fun f -> box (stamp1 "context" (Primitives.context index session f)))) |> ignore
 
         // impact
-        engine.SetValue("impact", Func<string, obj>(fun t -> box (Primitives.impact index session t))) |> ignore
+        engine.SetValue("impact", Func<string, obj>(fun t -> box (stamp "impact" (Primitives.impact index session t)))) |> ignore
 
-        // imports
+        // imports (returns string[], not dicts)
         engine.SetValue("imports", Func<string, obj>(fun f -> box (Primitives.imports index f))) |> ignore
 
-        // deps
+        // deps (returns string[], not dicts)
         engine.SetValue("deps", Func<string, obj>(fun p -> box (Primitives.deps index p))) |> ignore
 
         // expand
-        engine.SetValue("expand", Func<string, obj>(fun id -> box (Primitives.expand index session chunks id))) |> ignore
+        engine.SetValue("expand", Func<string, obj>(fun id -> box (stamp1 "expand" (Primitives.expand index session chunks id)))) |> ignore
 
         // neighborhood
         engine.SetValue("neighborhood", Func<string, obj, obj>(fun id opts ->
@@ -49,7 +59,7 @@ module QueryEngine =
                     let a = match o.Get("after") with v when not (v.IsUndefined()) -> int (v.AsNumber()) | _ -> 3
                     b, a
                 | _ -> 3, 3
-            box (Primitives.neighborhood index session chunks id before after))) |> ignore
+            box (stamp1 "neighborhood" (Primitives.neighborhood index session chunks id before after)))) |> ignore
 
         // similar
         engine.SetValue("similar", Func<string, obj, obj>(fun id opts ->
@@ -58,7 +68,7 @@ module QueryEngine =
                 | :? Jint.Native.JsObject as o ->
                     match o.Get("limit") with v when not (v.IsUndefined()) -> int (v.AsNumber()) | _ -> 5
                 | _ -> 5
-            box (Primitives.similar index session id limit))) |> ignore
+            box (stamp "similar" (Primitives.similar index session id limit)))) |> ignore
 
         // grep
         engine.SetValue("grep", Func<string, obj, obj>(fun pattern opts ->
@@ -70,13 +80,13 @@ module QueryEngine =
                     let f = match o.Get("file") with v when not (v.IsUndefined()) && not (v.IsNull()) -> v.AsString() | _ -> ""
                     l, k, f
                 | _ -> 10, "", ""
-            box (Primitives.grep index session chunks pattern limit kind file))) |> ignore
+            box (stamp "grep" (Primitives.grep index session chunks pattern limit kind file)))) |> ignore
 
         // files
-        engine.SetValue("files", Func<string, obj>(fun p -> box (Primitives.files index (if isNull p then "" else p)))) |> ignore
+        engine.SetValue("files", Func<string, obj>(fun p -> box (stamp "files" (Primitives.files index (if isNull p then "" else p))))) |> ignore
 
         // modules
-        engine.SetValue("modules", Func<obj>(fun () -> box (Primitives.modules index))) |> ignore
+        engine.SetValue("modules", Func<obj>(fun () -> box (stamp "modules" (Primitives.modules index)))) |> ignore
 
         // refs
         engine.SetValue("refs", Func<string, obj, obj>(fun name opts ->
@@ -85,7 +95,7 @@ module QueryEngine =
                 | :? Jint.Native.JsObject as o ->
                     match o.Get("limit") with v when not (v.IsUndefined()) -> int (v.AsNumber()) | _ -> 20
                 | _ -> 20
-            box (Primitives.refs index session chunks name limit))) |> ignore
+            box (stamp "refs" (Primitives.refs index session chunks name limit)))) |> ignore
 
         // walk
         engine.SetValue("walk", Func<string, obj, obj>(fun name opts ->
@@ -96,7 +106,42 @@ module QueryEngine =
                     let l = match o.Get("limit") with v when not (v.IsUndefined()) -> int (v.AsNumber()) | _ -> 5
                     d, l
                 | _ -> 2, 5
-            box (Primitives.walk index session chunks name depth limit))) |> ignore
+            box (stamp "walk" (Primitives.walk index session chunks name depth limit)))) |> ignore
+
+        // Composition helpers
+        engine.SetValue("print", Action<obj>(fun v ->
+            eprintfn "%s" (Format.formatValue v))) |> ignore
+
+        engine.Execute("""
+            function pipe(value) {
+                var fns = Array.prototype.slice.call(arguments, 1);
+                return fns.reduce(function(acc, fn) { return fn(acc); }, value);
+            }
+            function tap(value, fn) { fn(value); return value; }
+            function mergeBy(key) {
+                var arrays = Array.prototype.slice.call(arguments, 1);
+                var seen = {};
+                var result = [];
+                for (var i = 0; i < arrays.length; i++) {
+                    var arr = arrays[i];
+                    if (!arr) continue;
+                    for (var j = 0; j < arr.length; j++) {
+                        var item = arr[j];
+                        var k = item[key];
+                        if (k !== undefined && !seen[k]) { seen[k] = true; result.push(item); }
+                        else if (k === undefined) { result.push(item); }
+                    }
+                }
+                return result;
+            }
+        """) |> ignore
+
+        // Load user-defined functions
+        let userFns = FunctionStore.load repoRoot
+        let fnDecls = FunctionStore.toJsDeclarations userFns
+        for decl in fnDecls do
+            try engine.Execute(decl) |> ignore
+            with ex -> eprintfn "Warning: failed to load function: %s" ex.Message
 
         engine
 

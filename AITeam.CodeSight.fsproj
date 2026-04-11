@@ -22,6 +22,7 @@
     <Compile Include="src/Index/IndexStore.fs" />
     <Compile Include="src/Query/Format.fs" />
     <Compile Include="src/Query/Primitives.fs" />
+    <Compile Include="src/Query/FunctionStore.fs" />
     <Compile Include="src/Query/QueryEngine.fs" />
     <Compile Include="src/Query/Intel.fs" />
     <Compile Include="Program.fs" />
