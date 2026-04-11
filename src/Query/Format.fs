@@ -163,7 +163,6 @@ module Format =
         | :? string as s -> s
         | :? int as i -> string i
         | :? float as f -> if f = System.Math.Floor(f) && abs f < 1e15 then sprintf "%.0f" f else sprintf "%.3f" f
-        | :? System.Double as f -> if f = System.Math.Floor(f) && abs f < 1e15 then sprintf "%.0f" f else sprintf "%.3f" f
         | :? bool as b -> if b then "true" else "false"
         | other ->
             // Fallback: try JSON serialization for unknown types
