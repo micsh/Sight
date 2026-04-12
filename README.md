@@ -1,4 +1,4 @@
-# AITeam.CodeSight
+# CodeSight
 
 Code intelligence tool for any codebase. Indexes source code using tree-sitter AST parsing, then provides 13 query primitives via CLI. Agents and developers can search semantically, trace references, analyze impact, and explore code structure — all without reading full files.
 
