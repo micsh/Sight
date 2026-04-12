@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+          - os: windows-latest
+            rid: win-x64
+          - os: macos-latest
+            rid: osx-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+        dotnet-quality: 'preview'
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install parsers
+      run: cd parsers && npm install --legacy-peer-deps
+
+    - name: Publish
+      run: dotnet publish -c Release -r ${{ matrix.rid }} -o publish
+
+    - name: Archive (Linux/macOS)
+      if: runner.os != 'Windows'
+      run: tar -czf code-sight-${{ matrix.rid }}.tar.gz -C publish .
+
+    - name: Archive (Windows)
+      if: runner.os == 'Windows'
+      run: Compress-Archive -Path publish\* -DestinationPath code-sight-${{ matrix.rid }}.zip
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          code-sight-*.tar.gz
+          code-sight-*.zip
