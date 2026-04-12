@@ -150,10 +150,10 @@ module Format =
                 let matchLine = match d.TryGetValue("matchLine") with true, v when string v <> "" -> sprintf "\n       ▸ %s" (string v) | _ -> ""
                 let preview = match d.TryGetValue("preview") with true, v when string v <> "" -> sprintf "\n       ▸ %s" (string v) | _ -> ""
                 if id <> "" then sprintf "[%s] %s%s:%s (%s:%s)%s\n       %s%s%s" id score kind name file line sigStr summary matchLine preview
-                elif file <> "" then sprintf "%s — %s" file summary
                 else
                     d |> Seq.filter (fun kv -> kv.Key <> sourceKey)
-                    |> Seq.map (fun kv -> sprintf "%s=%s" kv.Key (formatValue kv.Value)) |> String.concat ", " |> sprintf "{%s}")
+                    |> Seq.map (fun kv -> sprintf "%s: %s" kv.Key (formatValue kv.Value))
+                    |> String.concat " | ")
             |> String.concat "\n"
 
         | :? (obj[]) as arr when arr.Length > 0 && (arr.[0] :? string) -> arr |> Array.map string |> String.concat "\n"
