@@ -2,8 +2,9 @@
   "name": "code-sight-parsers",
   "private": true,
   "dependencies": {
-    "tree-sitter": "^0.22.4",
+    "web-tree-sitter": "^0.24.7",
     "tree-sitter-c-sharp": "^0.23.1",
+    "tree-sitter-fsharp": "^0.1.0",
     "tree-sitter-typescript": "^0.23.2"
   },
   "optionalDependencies": {

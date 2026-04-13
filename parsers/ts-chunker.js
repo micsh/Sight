@@ -1,5 +1,6 @@
 /**
  * Tree-sitter based code chunker — interactive JSONL protocol.
+ * Uses web-tree-sitter (WASM) for cross-platform support.
  *
  * Protocol:
  *   → stdin:  {"cmd":"parse","file":"/path/to/File.fs","maxChars":3000}
@@ -16,7 +17,7 @@
  *   ts-chunker.js    — parser cache, JSONL protocol (this file, stable)
  */
 
-const Parser = require('tree-sitter');
+const Parser = require('web-tree-sitter');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
@@ -24,124 +25,113 @@ const readline = require('readline');
 const { LANGUAGES } = require('./languages/index');
 const { extractChunks, extractImports, extractTypeRefs, extractSignatures } = require('./chunker-core');
 
-// ─── Parser cache ─────────────────────────────────────────────────
+// ─── WASM file resolution ─────────────────────────────────────────
 
-const parsers = {};
+const WASM_FILES = {
+    'tree-sitter-fsharp':      'tree-sitter-fsharp/tree-sitter-fsharp.wasm',
+    'tree-sitter-c-sharp':     'tree-sitter-c-sharp/tree-sitter-c_sharp.wasm',
+    'tree-sitter-javascript':  'tree-sitter-javascript/tree-sitter-javascript.wasm',
+    'tree-sitter-typescript':  'tree-sitter-typescript/tree-sitter-typescript.wasm',
+    'tree-sitter-python':      'tree-sitter-python/tree-sitter-python.wasm',
+    'tree-sitter-go':          'tree-sitter-go/tree-sitter-go.wasm',
+    'tree-sitter-rust':        'tree-sitter-rust/tree-sitter-rust.wasm',
+};
 
-function getParser(ext) {
-    if (parsers[ext]) return parsers[ext];
+function resolveWasm(grammarName) {
+    const rel = WASM_FILES[grammarName];
+    if (!rel) return null;
+    return path.resolve(__dirname, 'node_modules', rel);
+}
+
+// ─── Language cache (async, caches loaded Language objects) ────────
+
+const languages = {};
+
+async function getLanguage(ext) {
+    if (languages[ext]) return languages[ext];
 
     const lang = LANGUAGES[ext];
     if (!lang) return null;
 
-    const parser = new Parser();
-    const langMod = require(lang.grammar || lang.mod);
-    const langObj = (lang.grammarKey || lang.key) ? langMod[lang.grammarKey || lang.key] : langMod;
-    parser.setLanguage(langObj);
-    parsers[ext] = { parser, lang };
-    return parsers[ext];
+    const wasmPath = resolveWasm(lang.grammar);
+    if (!wasmPath || !fs.existsSync(wasmPath)) {
+        console.error(`WASM not found for ${lang.grammar}: ${wasmPath}`);
+        return null;
+    }
+
+    const language = await Parser.Language.load(wasmPath);
+    languages[ext] = { language, lang };
+    return languages[ext];
 }
 
-// ─── Interactive JSONL protocol ───────────────────────────────────
+// ─── Command handlers ────────────────────────────────────────────
 
-const rl = readline.createInterface({ input: process.stdin, terminal: false });
-
-rl.on('line', (line) => {
-    try {
-        const cmd = JSON.parse(line);
-
-        if (cmd.cmd === 'quit') {
-            process.exit(0);
-        }
-
-        if (cmd.cmd === 'parse') {
-            const filePath = cmd.file;
-            const maxChars = cmd.maxChars || 3000;
-            const ext = path.extname(filePath).slice(1);
-
-            const cached = getParser(ext);
-            if (!cached) {
-                console.log(JSON.stringify({ ok: false, error: `Unsupported extension: .${ext}` }));
-                return;
-            }
-
-            const code = fs.readFileSync(filePath, 'utf8');
-            const tree = cached.parser.parse(code);
-            const chunks = extractChunks(tree, cached.lang, filePath, maxChars);
-
-            console.log(JSON.stringify({ ok: true, chunks }));
-        } else if (cmd.cmd === 'imports') {
-            const filePath = cmd.file;
-            const ext = path.extname(filePath).slice(1);
-
-            const cached = getParser(ext);
-            if (!cached) {
-                console.log(JSON.stringify({ ok: false, error: `Unsupported extension: .${ext}` }));
-                return;
-            }
-
-            const code = fs.readFileSync(filePath, 'utf8');
-            const tree = cached.parser.parse(code);
-            const imports = extractImports(tree, cached.lang, filePath);
-
-            console.log(JSON.stringify({ ok: true, imports }));
-        } else if (cmd.cmd === 'typerefs') {
-            const filePath = cmd.file;
-            const ext = path.extname(filePath).slice(1);
-
-            const cached = getParser(ext);
-            if (!cached) {
-                console.log(JSON.stringify({ ok: false, error: `Unsupported extension: .${ext}` }));
-                return;
-            }
-
-            const code = fs.readFileSync(filePath, 'utf8');
-            const tree = cached.parser.parse(code);
-            const typeRefs = extractTypeRefs(tree, cached.lang, filePath);
-
-            console.log(JSON.stringify({ ok: true, typeRefs }));
-        } else if (cmd.cmd === 'signatures') {
-            const filePath = cmd.file;
-            const ext = path.extname(filePath).slice(1);
-
-            const cached = getParser(ext);
-            if (!cached) {
-                console.log(JSON.stringify({ ok: false, error: `Unsupported extension: .${ext}` }));
-                return;
-            }
-
-            const code = fs.readFileSync(filePath, 'utf8');
-            const tree = cached.parser.parse(code);
-            const signatures = extractSignatures(tree, cached.lang, filePath);
-
-            console.log(JSON.stringify({ ok: true, signatures }));
-        } else if (cmd.cmd === 'languages') {
-            console.log(JSON.stringify({ ok: true, languages: Object.keys(LANGUAGES) }));
-        } else {
-            console.log(JSON.stringify({ ok: false, error: `Unknown command: ${cmd.cmd}` }));
-        }
-    } catch (e) {
-        console.log(JSON.stringify({ ok: false, error: e.message }));
+async function handleCommand(parser, cmd) {
+    if (cmd.cmd === 'quit') {
+        process.exit(0);
     }
-});
 
-// Also support single-shot mode (backward compat with old splitter.js)
-if (process.argv.length >= 3 && !process.stdin.isTTY) {
-    // Interactive mode — handled by readline above
-} else if (process.argv.length >= 3) {
-    const filePath = process.argv[2];
-    const maxChars = parseInt(process.argv[3] ?? '3000');
+    if (cmd.cmd === 'languages') {
+        return { ok: true, languages: Object.keys(LANGUAGES) };
+    }
+
+    const filePath = cmd.file;
     const ext = path.extname(filePath).slice(1);
-
-    const cached = getParser(ext);
+    const cached = await getLanguage(ext);
     if (!cached) {
-        console.error(`Unsupported extension: .${ext}`);
-        process.exit(1);
+        return { ok: false, error: `Unsupported extension: .${ext}` };
     }
 
+    parser.setLanguage(cached.language);
     const code = fs.readFileSync(filePath, 'utf8');
-    const tree = cached.parser.parse(code);
-    const chunks = extractChunks(tree, cached.lang, filePath, maxChars);
-    console.log(JSON.stringify(chunks));
-    process.exit(0);
+    const tree = parser.parse(code);
+
+    switch (cmd.cmd) {
+        case 'parse': {
+            const maxChars = cmd.maxChars || 3000;
+            const chunks = extractChunks(tree, cached.lang, filePath, maxChars);
+            return { ok: true, chunks };
+        }
+        case 'imports': {
+            const imports = extractImports(tree, cached.lang, filePath);
+            return { ok: true, imports };
+        }
+        case 'typerefs': {
+            const typeRefs = extractTypeRefs(tree, cached.lang, filePath);
+            return { ok: true, typeRefs };
+        }
+        case 'signatures': {
+            const signatures = extractSignatures(tree, cached.lang, filePath);
+            return { ok: true, signatures };
+        }
+        default:
+            return { ok: false, error: `Unknown command: ${cmd.cmd}` };
+    }
 }
+
+// ─── Sequential JSONL loop ───────────────────────────────────────
+
+async function main() {
+    const runtimeWasm = path.resolve(__dirname, 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm');
+    await Parser.init({
+        locateFile: () => runtimeWasm,
+    });
+
+    const parser = new Parser();
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+
+    for await (const line of rl) {
+        try {
+            const cmd = JSON.parse(line);
+            const result = await handleCommand(parser, cmd);
+            console.log(JSON.stringify(result));
+        } catch (e) {
+            console.log(JSON.stringify({ ok: false, error: e.message }));
+        }
+    }
+}
+
+main().catch(e => {
+    console.error('Fatal: ' + e.message);
+    process.exit(1);
+});

@@ -36,7 +36,7 @@ type CodeSightConfig = {
 module Config =
 
     let private defaultExtensions = [| ".fs"; ".fsi"; ".cs"; ".js"; ".ts"; ".py"; ".go"; ".rs" |]
-    let private defaultExclude = [| "node_modules"; "bin"; "obj"; ".git"; "wwwroot"; "dist" |]
+    let private defaultExclude = [| "node_modules"; "bin"; "obj"; ".git"; "wwwroot"; "dist"; "target"; "vendor"; "__pycache__" |]
 
     /// Auto-detect source directories by looking for common patterns.
     let private detectSrcDirs (repoRoot: string) =
