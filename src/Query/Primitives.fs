@@ -180,7 +180,7 @@ module Primitives =
 
     let similar (index: CodeIndex) (session: QuerySession) (refId: string) (limit: int) =
         match session.GetRef(refId) with
-        | None -> [||]
+        | None -> [| mdict [ "error", box (sprintf "ref %s not found" refId) ] |]
         | Some chunkIdx ->
             IndexStore.similar index chunkIdx limit true
             |> Array.map (fun (i, sim) ->
@@ -194,7 +194,7 @@ module Primitives =
 
     let grep (index: CodeIndex) (session: QuerySession) (chunks: CodeChunk[] option) (pattern: string) (limit: int) (kind: string) (filePattern: string) =
         match chunks with
-        | None -> [||]
+        | None -> [| mdict [ "error", box "source chunks not loaded — run 'code-sight index' first" ] |]
         | Some allChunks ->
             let regex = try Regex(pattern, RegexOptions.IgnoreCase ||| RegexOptions.Compiled) with _ -> Regex(Regex.Escape(pattern), RegexOptions.IgnoreCase ||| RegexOptions.Compiled)
             let results = ResizeArray()
@@ -238,11 +238,21 @@ module Primitives =
 
     // ── modules ──
 
-    let modules (index: CodeIndex) =
+    let modules (index: CodeIndex) (srcDirs: string[]) =
+        let srcSet = srcDirs |> Array.map (fun s -> s.ToLowerInvariant()) |> Set.ofArray
         index.Chunks |> Array.groupBy (fun c ->
             let parts = c.FilePath.Replace("\\", "/").Split('/')
-            let srcIdx = parts |> Array.tryFindIndex (fun p -> p = "src")
-            match srcIdx with Some i when i + 1 < parts.Length -> parts.[i + 1] | _ -> "other")
+            // Find the first directory that matches a configured srcDir
+            let srcIdx = parts |> Array.tryFindIndex (fun p -> srcSet.Contains(p.ToLowerInvariant()))
+            match srcIdx with
+            | Some i when i + 1 < parts.Length -> parts.[i + 1]
+            | _ ->
+                // Bucket by top-level directory or "other"
+                if parts.Length >= 2 then
+                    let top = parts.[0]
+                    if top.ToLowerInvariant().Contains("test") then sprintf "tests/%s" top
+                    else top
+                else "other")
         |> Array.sortBy fst
         |> Array.map (fun (proj, chunks) ->
             let fileNames = chunks |> Array.map (fun c -> Path.GetFileName c.FilePath) |> Array.distinct |> Array.sort
@@ -254,7 +264,7 @@ module Primitives =
 
     let refs (index: CodeIndex) (session: QuerySession) (chunks: CodeChunk[] option) (name: string) (limit: int) =
         match chunks with
-        | None -> [||]
+        | None -> [| mdict [ "error", box "source chunks not loaded — run 'code-sight index' first" ] |]
         | Some allChunks ->
             let regex = Regex(sprintf @"\b%s\b" (Regex.Escape name), RegexOptions.Compiled)
             let results = ResizeArray()
@@ -280,7 +290,7 @@ module Primitives =
     /// Chains refs() calls: finds refs of name, then refs of those, up to depth hops.
     let walk (index: CodeIndex) (session: QuerySession) (chunks: CodeChunk[] option) (startName: string) (maxDepth: int) (limitPerHop: int) =
         match chunks with
-        | None -> [||]
+        | None -> [| mdict [ "error", box "source chunks not loaded — run 'code-sight index' first" ] |]
         | Some allChunks ->
             let visited = HashSet<string>()
             let results = ResizeArray<Dictionary<string, obj>>()

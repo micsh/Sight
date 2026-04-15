@@ -47,7 +47,7 @@ module QueryEngine =
         result
 
     /// Create a Jint engine with all primitives wired.
-    let create (index: CodeIndex) (chunks: CodeChunk[] option) (embeddingUrl: string) (indexDir: string) (repoRoot: string) =
+    let create (index: CodeIndex) (chunks: CodeChunk[] option) (embeddingUrl: string) (indexDir: string) (repoRoot: string) (srcDirs: string[]) =
         let session = QuerySession(indexDir)
         let engine = Engine()
 
@@ -95,7 +95,7 @@ module QueryEngine =
         engine.SetValue("files", Func<string, obj>(fun p -> box (stamp "files" (Primitives.files index (if isNull p then "" else p))))) |> ignore
 
         // modules
-        engine.SetValue("modules", Func<obj>(fun () -> box (stamp "modules" (Primitives.modules index)))) |> ignore
+        engine.SetValue("modules", Func<obj>(fun () -> box (stamp "modules" (Primitives.modules index srcDirs)))) |> ignore
 
         // refs
         engine.SetValue("refs", Func<string, obj, obj>(fun name opts ->

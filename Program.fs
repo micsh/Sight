@@ -11,6 +11,7 @@ let printUsage () =
     printfn "  code-sight modules [--repo <path>]                   Show project map"
     printfn "  code-sight search <js> [--json] [--repo <path>] [--scope <s>] Run a query"
     printfn "  code-sight eval <js> [--json] [--repo <path>]                 Alias for search"
+    printfn "  code-sight eval - [--json] [--repo <path>]                    Read expression from stdin"
     printfn "  code-sight intel <question> [--repo <path>]          Ask about the codebase"
     printfn "  code-sight repl [--repo <path>] [--scope <s>]        Interactive mode"
     printfn "  code-sight scopes [--repo <path>]                    List available scopes"
@@ -558,26 +559,31 @@ let main args =
                     else None)
             // For modules/files/context/impact/imports/deps — no chunks needed
             // Pass None initially; primitives that need chunks will force the lazy
-            let mutable engine = QueryEngine.create index None cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot
+            let mutable engine = QueryEngine.create index None cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot cfg.SrcDirs
             let needsChunks = [| "expand"; "grep"; "refs"; "neighborhood"; "similar"; "walk" |]
             let ensureChunks (js: string) =
                 if needsChunks |> Array.exists (fun p -> js.Contains(p)) then
                     if not chunksRef.IsValueCreated then
-                        engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot
+                        engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot cfg.SrcDirs
 
             match command with
             | "modules" ->
                 printfn "%s" (QueryEngine.eval engine "modules()")
                 0
             | "search" ->
-                if query = "" then
+                let actualQuery =
+                    if query = "-" then
+                        use reader = new StreamReader(Console.OpenStandardInput())
+                        reader.ReadToEnd().Trim()
+                    else query
+                if actualQuery = "" then
                     eprintfn "Usage: code-sight search '<js query>'"
                     1
                 else
-                    ensureChunks query
+                    ensureChunks actualQuery
                     let result =
-                        if jsonOut then QueryEngine.evalJson engine query
-                        else QueryEngine.eval engine query
+                        if jsonOut then QueryEngine.evalJson engine actualQuery
+                        else QueryEngine.eval engine actualQuery
                     printfn "%s" result
                     0
             | "repl" ->
@@ -586,8 +592,7 @@ let main args =
                 eprintfn "  files(p?), context(file), expand(id), neighborhood(id,opts),"
                 eprintfn "  impact(type), imports(file), deps(pattern), similar(id,opts)"
                 eprintfn ""
-                // Pre-load chunks for repl since user will likely need them
-                engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot
+                engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot cfg.SrcDirs
                 let mutable running = true
                 while running do
                     eprintf "> "
@@ -604,7 +609,7 @@ let main args =
                     1
                 else
                     // Ensure chunks loaded for the mini-agent's code_search calls
-                    engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot
+                    engine <- QueryEngine.create index chunksRef.Value cfg.EmbeddingUrl cfg.IndexDir cfg.RepoRoot cfg.SrcDirs
                     let modulesCache= QueryEngine.eval engine "modules()"
                     let playbooksDir =
                         // 1. Per-repo override
