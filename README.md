@@ -77,7 +77,7 @@ code-sight index --repo /path/to/repo
 # Project map — what modules exist, how many files, key types
 code-sight modules
 
-# Direct queries — 13 primitives via JavaScript
+# Direct queries — 21 primitives via JavaScript
 code-sight search 'refs("MyType", {limit:10})'
 code-sight search 'context("Orchestrator.fs")'
 code-sight search 'grep("Result<string, CliError>")'
@@ -108,7 +108,7 @@ code-sight --help
 
 If `--repo` is omitted, uses the current working directory.
 
-## Primitives (13 functions)
+## Primitives (21 query + 3 session)
 
 | Function | Returns | Use for |
 |----------|---------|---------|
@@ -125,8 +125,22 @@ If `--repo` is omitted, uses the current working directory.
 | `neighborhood(id, {before, after})` | target code + surrounding chunks | code in context |
 | `similar(id, {limit})` | structurally similar chunks | find patterns |
 | `walk(name, {depth, limit})` | recursive reference chain tracing | call chains |
+| `callers(name, {limit})` | call sites of a qualified name | find who calls a function |
+| `changed(gitRef)` | chunks in files changed since a git ref | recent changes |
+| `hotspots({by, min})` | structural metrics per file: chunks, LOC, fanIn, fanOut | complexity analysis |
+| `explain(refId)` | full index metadata + findSource diagnosis | debugging refs |
+| `trace(from, to)` | BFS shortest path between two files over import graph | dependency paths |
+| `arch(file)` | owner module, boundary, depends_on, used_by, peer_modules | architectural context |
 
-Results carry ref IDs (R1, R2...) — pass them to `expand()` or `neighborhood()` to drill deeper.
+### Session Primitives
+
+| Function | Description |
+|----------|-------------|
+| `saveSession(name)` | Save current ref IDs and results to `{indexDir}/sessions/{name}.json` |
+| `loadSession(name)` | Restore a previously saved session |
+| `sessions()` | List all saved sessions |
+
+Results carry ref IDs (R1, R2...) — pass them to `expand()` or `neighborhood()` to drill deeper. Bare `R123` tokens are auto-quoted to `'R123'` before evaluation (ref-ID shorthand).
 
 Compose with JavaScript: `.filter()`, `.map()`, `let` variables. Each query is isolated.
 
@@ -259,23 +273,25 @@ code-sight.exe
   ├── src/Services/      Embedding HTTP client, file hashing (SHA256)
   ├── src/Parsing/       Tree-sitter Node.js process wrapper
   ├── src/Index/         TSV + binary persistence, in-memory queries
-  ├── src/Query/         13 primitives, Jint engine, FunctionStore, formatting, intel
+  ├── src/Query/         21 primitives, Jint engine, FunctionStore, formatting, intel
   ├── parsers/           JS files: ts-chunker.js, chunker-core.js, languages/*
   └── playbooks/         Strategy guides: orient, plan, blast, explore, review
 ```
 
 ## Notes
 
-- **All features except `intel` work without GitHub Copilot.** The `intel` command uses the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) to dispatch questions to a scout model. If you don't have Copilot, you still get all 13 primitives, UDFs, the REPL, and composition helpers.
+- **All features except `intel` work without GitHub Copilot.** The `intel` command uses the [GitHub Copilot SDK](https://github.com/github/copilot-sdk) to dispatch questions to a scout model. If you don't have Copilot, you still get all 21 primitives, UDFs, the REPL, session save/load, and composition helpers.
 - The embedding server must be running before `index` or `search` commands. Other commands (`modules`, `files`, `refs`, `grep`, `fn`) work offline against the cached index.
 - Index data is stored in `.code-intel/` at the repo root (gitignored by default).
 
 ## Future Ideas
 
-- **trace(fromRef, toRef)** — BFS path query over the dependency graph between two symbols.
 - **bridge(entity)** — Cross-index join between code-sight and knowledge-sight refs.
-- **arch integration** — Shell out to `arch context --json` and merge architectural boundaries into `context()` output.
 - **findings(query)** — Embedding search over accumulated session findings/insights.
+
+## Source
+
+[github.com/micsh/CodeSight](https://github.com/micsh/CodeSight)
 
 ## License
 
