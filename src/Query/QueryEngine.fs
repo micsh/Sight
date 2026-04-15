@@ -140,6 +140,14 @@ module QueryEngine =
         engine.SetValue("sessions", Func<obj>(fun () ->
             box (session.ListSessions()))) |> ignore
 
+        // trace
+        engine.SetValue("trace", Func<string, string, obj>(fun fromName toName ->
+            box (stamp "trace" (Primitives.trace index fromName toName)))) |> ignore
+
+        // arch
+        engine.SetValue("arch", Func<string, obj>(fun filePath ->
+            box (stamp1 "arch" (Primitives.arch repoRoot filePath)))) |> ignore
+
         // Composition helpers
         engine.SetValue("print", Action<obj>(fun v ->
             eprintfn "%s" (Format.formatValue v))) |> ignore

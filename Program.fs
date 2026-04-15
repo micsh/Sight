@@ -51,6 +51,8 @@ let printUsage () =
     printfn "  saveSession(name)                    Save current ref session as a named snapshot"
     printfn "  loadSession(name)                    Load a previously saved ref session"
     printfn "  sessions()                           List saved sessions"
+    printfn "  trace(from, to)                      BFS shortest path between two files"
+    printfn "  arch(file)                           Architectural context from arch tool"
     printfn ""
     printfn "Composition helpers:"
     printfn "  pipe(value, fn1, fn2, ...)           Thread value through functions"

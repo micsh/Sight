@@ -518,3 +518,122 @@ module Primitives =
                 "sourceMatch", box sourceMatch ]
             for kv in c.Extra do d.[kv.Key] <- box kv.Value
             d
+
+    // ── trace ──
+
+    /// trace(from, to) — BFS shortest path between two files/modules over the import graph.
+    let trace (index: CodeIndex) (fromName: string) (toName: string) =
+        let resolveFile (name: string) =
+            let files = index.Chunks |> Array.map (fun c -> Path.GetFileName c.FilePath) |> Array.distinct
+            files |> Array.tryFind (fun f -> f.Contains(name, StringComparison.OrdinalIgnoreCase))
+            |> Option.orElseWith (fun () ->
+                files |> Array.tryFind (fun f -> Path.GetFileNameWithoutExtension(f).Equals(name, StringComparison.OrdinalIgnoreCase)))
+
+        match resolveFile fromName, resolveFile toName with
+        | None, _ -> [| mdict [ "error", box (sprintf "could not resolve '%s' to a file" fromName) ] |]
+        | _, None -> [| mdict [ "error", box (sprintf "could not resolve '%s' to a file" toName) ] |]
+        | Some startFile, Some endFile when startFile = endFile ->
+            [| mdict [ "path", box [| startFile |]; "length", box 0 ] |]
+        | Some startFile, Some endFile ->
+            // Build file→file adjacency from imports
+            // An import like "crate::broker::delivery::..." or "System.IO" is matched to any file
+            // whose name (sans extension) appears as a segment in the import path
+            let allFiles = index.Chunks |> Array.map (fun c -> Path.GetFileName c.FilePath) |> Array.distinct
+            let fileStems = allFiles |> Array.map (fun f -> f, Path.GetFileNameWithoutExtension(f).ToLowerInvariant()) |> dict
+            let adj = Dictionary<string, HashSet<string>>()
+            for f in allFiles do adj.[f] <- HashSet()
+            for (filePath, importedModule) in index.Imports do
+                let src = Path.GetFileName filePath
+                let mLower = importedModule.ToLowerInvariant()
+                // Match import against file stems: "delivery" in "crate::broker::delivery::DeliveryEngine"
+                for kv in fileStems do
+                    if kv.Key <> src && mLower.Contains(kv.Value) && kv.Value.Length >= 3 then
+                        if adj.ContainsKey src then adj.[src].Add(kv.Key) |> ignore
+
+            // BFS (bidirectional edges: if A imports B, both A→B and B→A are traversable)
+            let visited = HashSet<string>()
+            let parent = Dictionary<string, string>()
+            let queue = Queue<string>()
+            queue.Enqueue(startFile)
+            visited.Add(startFile) |> ignore
+            let mutable found = false
+            while queue.Count > 0 && not found do
+                let current = queue.Dequeue()
+                let neighbors = ResizeArray<string>()
+                // Forward edges
+                if adj.ContainsKey current then
+                    for n in adj.[current] do if not (visited.Contains n) then neighbors.Add(n)
+                // Reverse edges
+                for kv in adj do
+                    if kv.Value.Contains(current) && not (visited.Contains kv.Key) then
+                        neighbors.Add(kv.Key)
+                for next in neighbors |> Seq.distinct do
+                    if not (visited.Contains next) then
+                        visited.Add(next) |> ignore
+                        parent.[next] <- current
+                        if next = endFile then found <- true
+                        queue.Enqueue(next)
+            if not found then
+                [| mdict [ "error", box (sprintf "no path from '%s' to '%s'" startFile endFile) ] |]
+            else
+                let path = ResizeArray<string>()
+                let mutable cur = endFile
+                while cur <> startFile do
+                    path.Add(cur)
+                    cur <- parent.[cur]
+                path.Add(startFile)
+                path.Reverse()
+                [| mdict [ "path", box (path.ToArray()); "length", box (path.Count - 1) ] |]
+
+    // ── arch ──
+
+    /// arch(file) — get architectural context from the arch tool. Graceful fallback if unavailable.
+    let arch (repoRoot: string) (filePath: string) =
+        try
+            let psi = System.Diagnostics.ProcessStartInfo("arch", sprintf "context --file %s --json" filePath)
+            psi.WorkingDirectory <- repoRoot
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            psi.UseShellExecute <- false
+            psi.CreateNoWindow <- true
+            use proc = System.Diagnostics.Process.Start(psi)
+            let output = proc.StandardOutput.ReadToEnd()
+            proc.WaitForExit()
+            if proc.ExitCode <> 0 then
+                // Check if it's "not found" vs actual error
+                if output.Contains("not found") then
+                    mdict [ "available", box false; "reason", box "arch not initialized for this repo (run 'arch init')" ]
+                else
+                    mdict [ "error", box (sprintf "arch exited with code %d" proc.ExitCode) ]
+            else
+                try
+                    let doc = System.Text.Json.JsonDocument.Parse(output)
+                    let root = doc.RootElement
+                    // Check for error field
+                    match root.TryGetProperty("error") with
+                    | true, errVal -> mdict [ "available", box false; "reason", box (errVal.GetString()) ]
+                    | _ ->
+                        let str (p: string) = match root.TryGetProperty(p) with true, v when v.ValueKind <> System.Text.Json.JsonValueKind.Null -> v.GetString() | _ -> ""
+                        let arr (p: string) =
+                            match root.TryGetProperty(p) with
+                            | true, v when v.ValueKind = System.Text.Json.JsonValueKind.Array ->
+                                [| for item in v.EnumerateArray() -> item.GetString() |] |> Array.filter (fun s -> s <> null && s <> "")
+                            | _ -> [||]
+                        let ownerModule = str "owner_module"
+                        let boundary = str "boundary"
+                        let dependsOn = arr "depends_on"
+                        let usedBy = arr "used_by"
+                        let peerModules = arr "peer_modules"
+                        let d = mdict [
+                            "available", box true; "file", box filePath
+                            "ownerModule", box ownerModule; "boundary", box boundary
+                            "dependsOn", box dependsOn; "usedBy", box usedBy
+                            "peerModules", box peerModules ]
+                        d
+                with _ ->
+                    mdict [ "error", box "failed to parse arch output" ]
+        with
+        | :? System.ComponentModel.Win32Exception ->
+            mdict [ "available", box false; "reason", box "arch tool not found on PATH" ]
+        | ex ->
+            mdict [ "available", box false; "reason", box ex.Message ]
