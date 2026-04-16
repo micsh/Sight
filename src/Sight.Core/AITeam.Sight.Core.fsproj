@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>AITeam.Sight.Core</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="EmbeddingService.fs" />
+    <Compile Include="FunctionStore.fs" />
+    <Compile Include="QueryHelpers.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Jint" Version="4.7.0" />
+    <PackageReference Update="FSharp.Core" Version="10.1.201" />
+  </ItemGroup>
+
+</Project>

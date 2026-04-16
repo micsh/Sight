@@ -6,4 +6,7 @@
   <Folder Name="/src/KnowledgeSight/">
     <Project Path="src/KnowledgeSight/AITeam.KnowledgeSight.fsproj" />
   </Folder>
+  <Folder Name="/src/Sight.Core/">
+    <Project Path="src/Sight.Core/AITeam.Sight.Core.fsproj" />
+  </Folder>
 </Solution>

@@ -5,6 +5,7 @@ open System.Collections.Generic
 open System.IO
 open System.Text.RegularExpressions
 open Jint
+open AITeam.Sight.Core
 
 /// Jint-based query engine. Wires all primitives, evaluates JS, formats results.
 module QueryEngine =
@@ -174,90 +175,20 @@ module QueryEngine =
         engine.SetValue("sessions", Func<obj>(fun () ->
             box (session.ListSessions()))) |> ignore
 
-        // Composition helpers
-        engine.SetValue("print", Action<obj>(fun v ->
-            eprintfn "%s" (Format.formatValue v))) |> ignore
-
-        engine.Execute("""
-            function pipe(value) {
-                var fns = Array.prototype.slice.call(arguments, 1);
-                return fns.reduce(function(acc, fn) { return fn(acc); }, value);
-            }
-            function tap(value, fn) { fn(value); return value; }
-            function mergeBy(key) {
-                var arrays = Array.prototype.slice.call(arguments, 1);
-                var seen = {};
-                var result = [];
-                for (var i = 0; i < arrays.length; i++) {
-                    var arr = arrays[i];
-                    if (!arr) continue;
-                    for (var j = 0; j < arr.length; j++) {
-                        var item = arr[j];
-                        var k = item[key];
-                        if (k !== undefined && !seen[k]) { seen[k] = true; result.push(item); }
-                        else if (k === undefined) { result.push(item); }
-                    }
-                }
-                return result;
-            }
-        """) |> ignore
-
-        // Load user-defined functions
-        let userFns = FunctionStore.load repoRoot
-        let fnDecls = FunctionStore.toJsDeclarations userFns
-        for decl in fnDecls do
-            try engine.Execute(decl) |> ignore
-            with ex -> eprintfn "Warning: failed to load function: %s" ex.Message
+        // Composition helpers + user-defined functions (from Sight.Core)
+        QueryHelpers.registerHelpers engine Format.formatValue
+        QueryHelpers.registerUserFunctions engine
+            { FileName = "knowledge-sight.functions.json"
+              ReservedNames = FunctionStore.reservedNames }
+            repoRoot
 
         engine
 
     /// Wrap JS in an IIFE for evaluation.
-    let private wrapIIFE (js: string) =
-        // Ref-ID shorthand: rewrite bare R123 to 'R123' (outside of strings)
-        let refRewritten = Regex.Replace(js, @"(?<![""'a-zA-Z_])R(\d+)(?![""'a-zA-Z_])", "'R$1'")
-        let stripped = refRewritten.Split('\n') |> Array.map (fun line ->
-            let commentIdx = line.IndexOf("//")
-            if commentIdx >= 0 then line.Substring(0, commentIdx) else line) |> String.concat "\n"
-        let trimmed = stripped.Trim()
-        if trimmed.StartsWith("(") && trimmed.EndsWith(")") then trimmed
-        else
-            let lines = trimmed.Split('\n') |> Array.map (fun s -> s.Trim()) |> Array.filter (fun s -> s <> "")
-            let joined = lines |> String.concat " "
-            let lastSemi = joined.LastIndexOf(';')
-            if lastSemi > 0 && lastSemi < joined.Length - 2 then
-                let stmts = joined.Substring(0, lastSemi + 1)
-                let expr = joined.Substring(lastSemi + 1).Trim()
-                if expr.Length > 0 then
-                    sprintf "(function() { %s return %s; })()" stmts expr
-                else
-                    sprintf "(function() { return %s; })()" joined
-            elif joined.StartsWith("let ") || joined.StartsWith("const ") || joined.StartsWith("var ") then
-                sprintf "(function() { %s })()" joined
-            else
-                sprintf "(function() { return %s; })()" joined
-
     /// Evaluate JS with IIFE wrapping — human-readable formatted output.
     let eval (engine: Engine) (js: string) : string =
-        try
-            let toEval = wrapIIFE js
-            engine.SetValue("__result__", engine.Evaluate(toEval)) |> ignore
-            let jsonResult = engine.Evaluate("typeof __result__ === 'string' ? __result__ : JSON.stringify(__result__, null, 2)")
-            let text = jsonResult.AsString()
-
-            if text.StartsWith("[R") || text.StartsWith("──") then text
-            else
-                let native = engine.Evaluate("__result__").ToObject()
-                try Format.formatValue native
-                with _ -> text
-        with ex -> sprintf "Error: %s" ex.Message
+        QueryHelpers.eval engine Format.formatValue js
 
     /// Evaluate JS with IIFE wrapping — raw JSON output for machine consumption.
     let evalJson (engine: Engine) (js: string) : string =
-        try
-            let toEval = wrapIIFE js
-            engine.SetValue("__result__", engine.Evaluate(toEval)) |> ignore
-            let jsonResult = engine.Evaluate("typeof __result__ === 'string' ? __result__ : JSON.stringify(__result__, null, 2)")
-            jsonResult.AsString()
-        with ex ->
-            let escaped = ex.Message.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", " ")
-            sprintf """{"error":"%s"}""" escaped
+        QueryHelpers.evalJson engine js

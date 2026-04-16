@@ -1,5 +1,6 @@
 open System
 open System.IO
+open AITeam.Sight.Core
 open AITeam.KnowledgeSight
 
 /// Ensure index dir exists and has a .gitignore so repos don't need to add it.

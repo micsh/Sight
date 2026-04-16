@@ -4,6 +4,7 @@ open System
 open System.Collections.Generic
 open System.IO
 open System.Text.RegularExpressions
+open AITeam.Sight.Core
 
 /// Ref tracking for expand/neighborhood across queries.
 type QuerySession(indexDir: string) =

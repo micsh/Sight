@@ -20,6 +20,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\Sight.Core\AITeam.Sight.Core.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Compile Include="src/Types/Types.fs" />
     <Compile Include="src/Config/Config.fs" />
     <Compile Include="src/Services/Services.fs" />

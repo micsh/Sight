@@ -1,5 +1,6 @@
 open System
 open System.IO
+open AITeam.Sight.Core
 open AITeam.CodeSight
 
 let printUsage () =
