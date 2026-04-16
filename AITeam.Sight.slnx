@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/" />
+  <Folder Name="/src/CodeSight/">
+    <Project Path="src/CodeSight/AITeam.CodeSight.fsproj" />
+  </Folder>
+  <Folder Name="/src/KnowledgeSight/">
+    <Project Path="src/KnowledgeSight/AITeam.KnowledgeSight.fsproj" />
+  </Folder>
+</Solution>

@@ -1,8 +1,10 @@
 bin/
 obj/
 .code-intel/
+.knowledge-sight/
+.project-memory/
+.memory-project/
 *.user
 .vs/
-parsers/node_modules/
+node_modules/
 experiments/
-.project-memory/
