@@ -20,6 +20,20 @@ type KnowledgeSightConfig = {
     PromoteCollision: string
 }
 
+module CliOutput =
+
+    let mutable private quiet = false
+
+    let setQuiet (enabled: bool) =
+        quiet <- enabled
+
+    let info format =
+        Printf.kprintf
+            (fun message ->
+                if not quiet then
+                    Console.Error.WriteLine(message))
+            format
+
 module Config =
 
     let private defaultExclude = [| "node_modules"; "bin"; "obj"; ".git"; "wwwroot"; "dist"; ".code-intel" |]
@@ -28,6 +42,44 @@ module Config =
         let trimmed = dir.Replace("\\", "/").Trim().Trim('/')
         if trimmed = "" then "."
         else trimmed
+
+    let private normalizeConfiguredDir (dir: string) =
+        normalizeScanDir dir
+
+    let resolveInboxDir (cfg: KnowledgeSightConfig) =
+        let normalizedInboxDir = normalizeConfiguredDir cfg.InboxDir
+
+        if normalizedInboxDir = "."
+           || normalizedInboxDir.Contains("/", StringComparison.Ordinal) then
+            Ok normalizedInboxDir
+        else
+            let nestedCandidates =
+                cfg.DocDirs
+                |> Array.map normalizeConfiguredDir
+                |> Array.filter (fun dir ->
+                    dir <> "."
+                    && not (String.Equals(dir, normalizedInboxDir, StringComparison.OrdinalIgnoreCase)))
+                |> Array.map (fun dir -> normalizeConfiguredDir (dir + "/" + normalizedInboxDir))
+                |> Array.distinct
+                |> Array.filter (fun candidate ->
+                    let candidatePath = Path.Combine(cfg.RepoRoot, candidate.Replace("/", string Path.DirectorySeparatorChar))
+                    Directory.Exists candidatePath)
+
+            if nestedCandidates.Length = 0 then
+                Ok normalizedInboxDir
+            else
+                let configuredDocDirs =
+                    cfg.DocDirs
+                    |> Array.map normalizeConfiguredDir
+                    |> String.concat ", "
+
+                Error (
+                    sprintf
+                        "inboxDir '%s' is ambiguous for docDirs [%s]: found nested inbox root(s) at %s. Set inboxDir to the intended repo-relative inbox root explicitly."
+                        cfg.InboxDir
+                        configuredDocDirs
+                        (String.concat ", " nestedCandidates)
+                )
 
     /// Auto-detect directories containing markdown files.
     let private detectDocDirs (repoRoot: string) =
@@ -92,23 +144,27 @@ module Config =
                 PromoteCollision = "suffix"
             }
 
-    let private scanDocDirs (cfg: KnowledgeSightConfig) =
-        [| yield! cfg.DocDirs; yield cfg.InboxDir |]
-        |> Array.filter (String.IsNullOrWhiteSpace >> not)
-        |> Array.map normalizeScanDir
-        |> Array.distinct
+    let scanDocDirs (cfg: KnowledgeSightConfig) =
+        resolveInboxDir cfg
+        |> Result.map (fun inboxDir ->
+            [| yield! cfg.DocDirs; yield inboxDir |]
+            |> Array.filter (String.IsNullOrWhiteSpace >> not)
+            |> Array.map normalizeScanDir
+            |> Array.distinct)
 
     /// Find all .md files under the configured doc dirs.
     let findDocFiles (cfg: KnowledgeSightConfig) =
         scanDocDirs cfg
-        |> Array.collect (fun dir ->
-            let absDir = Path.Combine(cfg.RepoRoot, dir)
-            if Directory.Exists absDir then
-                Directory.EnumerateFiles(absDir, "*.md", SearchOption.AllDirectories)
-                |> Seq.filter (fun f ->
-                    let rel = Path.GetRelativePath(cfg.RepoRoot, f).Replace("\\", "/")
-                    cfg.Exclude |> Array.forall (fun ex -> not (rel.Contains(ex))))
-                |> Seq.toArray
-            else [||])
-        |> Array.distinct
-        |> Array.sort
+        |> Result.map (fun scanDirs ->
+            scanDirs
+            |> Array.collect (fun dir ->
+                let absDir = Path.Combine(cfg.RepoRoot, dir)
+                if Directory.Exists absDir then
+                    Directory.EnumerateFiles(absDir, "*.md", SearchOption.AllDirectories)
+                    |> Seq.filter (fun f ->
+                        let rel = Path.GetRelativePath(cfg.RepoRoot, f).Replace("\\", "/")
+                        cfg.Exclude |> Array.forall (fun ex -> not (rel.Contains(ex))))
+                    |> Seq.toArray
+                else [||])
+            |> Array.distinct
+            |> Array.sort)

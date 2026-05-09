@@ -5,6 +5,7 @@ open System.Collections.Generic
 open System.IO
 open System.Net.Http
 open System.Net.Sockets
+open System.Numerics
 open System.Security.Cryptography
 open System.Text.RegularExpressions
 open System.Text
@@ -144,11 +145,14 @@ module Primitives =
         Path.Combine(repoRoot, relativePath.Replace("/", string Path.DirectorySeparatorChar))
 
     let private inboxPrefix (cfg: KnowledgeSightConfig) =
-        cfg.InboxDir.Trim('/').Replace("\\", "/") + "/"
+        Config.resolveInboxDir cfg
+        |> Result.map (fun inboxDir -> inboxDir.Trim('/').Replace("\\", "/") + "/")
 
     let private isInboxPath (cfg: KnowledgeSightConfig) (path: string) =
         let rel = relativeRepoPath cfg.RepoRoot path
-        rel.StartsWith(inboxPrefix cfg, StringComparison.OrdinalIgnoreCase)
+        match inboxPrefix cfg with
+        | Ok prefix -> rel.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+        | Error _ -> false
 
     let effectiveDocStatus (cfg: KnowledgeSightConfig) (index: DocIndex) (path: string) =
         let frontmatterStatus =
@@ -165,21 +169,25 @@ module Primitives =
 
     // ── catalog (like modules in code-sight) ──
 
+    let private catalogDirectoryKey (cfg: KnowledgeSightConfig) (filePath: string) =
+        let relativePath =
+            if Path.IsPathRooted(filePath) then relativeRepoPath cfg.RepoRoot filePath
+            else normPath filePath
+
+        let normalized = normPath relativePath
+        let parts = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries)
+
+        if parts.Length >= 2 then
+            String.concat "/" parts.[0 .. parts.Length - 2]
+        else
+            "root"
+
     let catalog (cfg: KnowledgeSightConfig) (index: DocIndex) (statuses: string[]) =
         let allowedStatuses = normalizeRequestedStatuses statuses
 
         index.Chunks
         |> Array.filter (fun c -> matchesDocStatus cfg index allowedStatuses c.FilePath)
-        |> Array.groupBy (fun c ->
-            let parts = c.FilePath.Replace("\\", "/").Split('/')
-            // Group by first directory under repo (e.g., "knowledge", "design", "pocs")
-            let dotsIdx = parts |> Array.tryFindIndex (fun p -> p.StartsWith("."))
-            match dotsIdx with
-            | Some i when i + 1 < parts.Length -> parts.[i] + "/" + parts.[i + 1]
-            | Some i -> parts.[i]
-            | None ->
-                if parts.Length >= 2 then parts.[parts.Length - 2]
-                else "root")
+        |> Array.groupBy (fun c -> catalogDirectoryKey cfg c.FilePath)
         |> Array.sortBy fst
         |> Array.map (fun (dir, chunks) ->
             let fileNames = chunks |> Array.map (fun c -> Path.GetFileName c.FilePath) |> Array.distinct |> Array.sort
@@ -370,13 +378,16 @@ module Primitives =
         |> Array.choose (fun (filePath, chunks) ->
             let fileName = Path.GetFileName(filePath)
             if String.IsNullOrEmpty(pattern) || fileName.Contains(pattern, StringComparison.OrdinalIgnoreCase) || pathContainsPattern filePath pattern then
-                let fm = index.Frontmatters |> Map.tryFind filePath
+                let fm = frontmatterForFile index filePath
+                let frontmatterSource, frontmatter = indexedFrontmatterPayload fm
                 let title = fm |> Option.map (fun f -> f.Title) |> Option.defaultValue ""
                 let tags = fm |> Option.map (fun f -> f.Tags |> String.concat ",") |> Option.defaultValue ""
                 let backlinks = IndexStore.backlinks index filePath
                 Some (mdict [ "file", box fileName; "path", box filePath; "sections", box chunks.Length
                               "title", box title; "tags", box tags; "backlinks", box backlinks.Length
-                              "words", box (chunks |> Array.sumBy (fun c -> c.WordCount)) ])
+                              "words", box (chunks |> Array.sumBy (fun c -> c.WordCount))
+                              "frontmatterSource", box frontmatterSource
+                              "frontmatter", box frontmatter ])
             else None)
         |> Array.sortBy (fun d -> string d.["file"])
 
@@ -591,6 +602,17 @@ module Primitives =
 
         score
 
+    let private allowShortProposeClaim (para: string) =
+        let lower = para.ToLowerInvariant()
+        let prescriptive = [| " should "; " must "; " always "; " never "; " when "; " ensure "; " requires "; " depends on "; " means that " |]
+        let declarative = [| " is a "; " are "; " defines "; " represents "; " consists of "; " handles "; " processes " |]
+        let hedging = [| " maybe "; " perhaps "; " i wonder "; " not sure "; " might "; " could be "; " i think "; "?" |]
+        let hasPattern (patterns: string[]) = patterns |> Array.exists lower.Contains
+
+        para.Length < 50
+        && not (hasPattern hedging)
+        && (hasPattern prescriptive || hasPattern declarative)
+
     /// Split text into paragraphs, embed each, compare to index.
     /// Classifies each paragraph as: off-topic, musing, novel, or covered.
     let novelty (cfg: KnowledgeSightConfig) (index: DocIndex) (embeddingUrl: string) (text: string) (threshold: float) (statuses: string[]) =
@@ -641,9 +663,9 @@ module Primitives =
         not (isInboxPath cfg path)
         && effectiveDocStatus cfg index path = "active"
 
-    let private isPendingInboxFile (cfg: KnowledgeSightConfig) (path: string) (frontmatter: Frontmatter) =
+    let private isPendingInboxFile (cfg: KnowledgeSightConfig) (index: DocIndex) (path: string) (frontmatter: Frontmatter) =
         isInboxPath cfg path
-        && frontmatter.Status.Equals("pending", StringComparison.OrdinalIgnoreCase)
+        && effectiveDocStatus cfg index path = "pending"
         && not (frontmatterFields frontmatter |> Map.containsKey "disposition")
 
     let private busTokens (text: string) =
@@ -746,16 +768,75 @@ module Primitives =
 
     let private cycleFormat = "yyyy-MM-dd'T'HH-mm-ss'Z'"
 
-    let private tryParseCycle (cycle: string) =
+    type private CycleValue =
+        | TimestampCycle of DateTime
+        | IntegerCycle of BigInteger
+
+    let private tryParseTimestampCycle (cycle: string) =
         match DateTime.TryParseExact(cycle, cycleFormat, Globalization.CultureInfo.InvariantCulture, Globalization.DateTimeStyles.AssumeUniversal ||| Globalization.DateTimeStyles.AdjustToUniversal) with
         | true, parsed -> Some parsed
         | _ -> None
 
+    let private tryParseIntegerCycle (cycle: string) =
+        let trimmed = cycle.Trim()
+
+        if String.IsNullOrWhiteSpace(trimmed) then
+            None
+        elif Regex.IsMatch(trimmed, @"^[0-9]+$") then
+            Some(BigInteger.Parse(trimmed, Globalization.CultureInfo.InvariantCulture))
+        else
+            None
+
+    let private tryParseCycleValue (cycle: string) =
+        let trimmed = cycle.Trim()
+
+        match tryParseTimestampCycle trimmed with
+        | Some parsed -> Some(TimestampCycle parsed)
+        | None -> tryParseIntegerCycle trimmed |> Option.map IntegerCycle
+
+    let private normalizeCycle (cycle: string) =
+        let trimmed = cycle.Trim()
+
+        match tryParseTimestampCycle trimmed with
+        | Some parsed -> Some(parsed.ToString(cycleFormat, Globalization.CultureInfo.InvariantCulture))
+        | None ->
+            tryParseIntegerCycle trimmed
+            |> Option.map (fun parsed -> parsed.ToString(Globalization.CultureInfo.InvariantCulture))
+
     let private isValidCycle (cycle: string) =
-        tryParseCycle cycle |> Option.isSome
+        normalizeCycle cycle |> Option.isSome
+
+    let private compareCycleValues (left: string) (right: string) =
+        let leftTrimmed = left.Trim()
+        let rightTrimmed = right.Trim()
+
+        match tryParseCycleValue leftTrimmed, tryParseCycleValue rightTrimmed with
+        | Some(TimestampCycle leftCycle), Some(TimestampCycle rightCycle) -> compare leftCycle rightCycle
+        | Some(IntegerCycle leftCycle), Some(IntegerCycle rightCycle) -> compare leftCycle rightCycle
+        | Some(TimestampCycle _), Some(IntegerCycle _) -> -1
+        | Some(IntegerCycle _), Some(TimestampCycle _) -> 1
+        | Some _, None -> -1
+        | None, Some _ -> 1
+        | None, None -> String.Compare(leftTrimmed, rightTrimmed, StringComparison.OrdinalIgnoreCase)
+
+    let private cycleFormName (cycle: string) =
+        match tryParseCycleValue cycle with
+        | Some(TimestampCycle _) -> Some "utc"
+        | Some(IntegerCycle _) -> Some "integer"
+        | None -> None
+
+    let private cycleOnOrBefore (cycle: string) (before: string) =
+        let cycleTrimmed = cycle.Trim()
+        let beforeTrimmed = before.Trim()
+
+        match tryParseCycleValue cycleTrimmed, tryParseCycleValue beforeTrimmed with
+        | Some(TimestampCycle cycleValue), Some(TimestampCycle beforeValue) -> cycleValue <= beforeValue
+        | Some(IntegerCycle cycleValue), Some(IntegerCycle beforeValue) -> cycleValue <= beforeValue
+        | Some _, Some _ -> false
+        | _ -> String.Compare(cycleTrimmed, beforeTrimmed, StringComparison.OrdinalIgnoreCase) <= 0
 
     let private humanizeAge (cycle: string) =
-        match tryParseCycle cycle with
+        match tryParseTimestampCycle cycle with
         | None -> ""
         | Some parsed ->
             let delta = DateTime.UtcNow - parsed
@@ -860,11 +941,20 @@ module Primitives =
     let private yamlScalar (value: string) =
         System.Text.Json.JsonSerializer.Serialize(value)
 
+    let private yamlVerifyScalar (value: string) =
+        let decoded = decodeStoredVerifyExpression value
+        if decoded.Contains('\n') || decoded.Contains('\r') then
+            yamlScalar decoded
+        else
+            decoded
+
     let private frontmatterYaml (frontmatter: Frontmatter) =
         let lines = ResizeArray<string>()
         lines.Add("---")
         for (key, value) in orderedFrontmatterFields frontmatter do
             match value with
+            | Scalar scalar when String.Equals(key, "verify", StringComparison.OrdinalIgnoreCase) ->
+                lines.Add(sprintf "%s: %s" key (yamlVerifyScalar scalar))
             | Scalar scalar -> lines.Add(sprintf "%s: %s" key (yamlScalar scalar))
             | StringList values ->
                 lines.Add(sprintf "%s:" key)
@@ -2065,19 +2155,18 @@ module Primitives =
         if tokens.Length = 0 then ""
         else String.concat " " tokens
 
-    let private synthesizeVerify (index: DocIndex) (claimText: string) (placementPath: string option) =
-        match placementPath with
-        | None -> None
-        | Some path ->
-            match frontmatterForFile index path with
-            | Some frontmatter when frontmatter.Related.Length > 0 ->
-                let phrase = claimPhrase claimText
-                if phrase = "" then None
-                else
-                    let escapedPhrase = phrase.Replace("'", "\\'")
+    let private synthesizeVerify (index: DocIndex) (claimText: string) (placementPaths: string[]) =
+        let phrase = claimPhrase claimText
+        if phrase = "" then None
+        else
+            let escapedPhrase = phrase.Replace("'", "\\'")
+            placementPaths
+            |> Array.tryPick (fun path ->
+                match frontmatterForFile index path with
+                | Some frontmatter when frontmatter.Related.Length > 0 ->
                     let relatedPath = frontmatter.Related.[0].Replace("\\", "/")
                     Some (sprintf "grep('%s', {file:'%s'}).length > 0" escapedPhrase relatedPath)
-            | _ -> None
+                | _ -> None)
 
     let private createInboxFrontmatter (title: string) (team: string) (cycle: string) (confidence: string) (concept: string) (verify: string) (observable: string) (forbids: string) (suggestedTarget: string) =
         let baseFrontmatter =
@@ -2104,6 +2193,7 @@ module Primitives =
                 (text: string) (team: string) (cycle: string) (concept: string) (confidence: string) (verify: string) (observable: string) (forbids: string)
                 (threshold: float) (dryRun: bool) =
         let normalizedTeam = normalizeTeam team
+        let normalizedCycle = normalizeCycle cycle
         let paragraphs = splitKnowledgeParagraphs text
         let requireFieldsError =
             String.Equals((cfg.RequireFieldsMode |> Option.ofObj |> Option.defaultValue "").Trim(), "error", StringComparison.OrdinalIgnoreCase)
@@ -2111,320 +2201,351 @@ module Primitives =
         if String.IsNullOrWhiteSpace(normalizedTeam) then
             [| mdict [ "status", box "blocked"; "score", box 0.0; "error", box "team is required" ] |]
         elif not (isValidCycle cycle) then
-            [| mdict [ "status", box "blocked"; "score", box 0.0; "error", box "cycle must use filename-safe UTC form yyyy-MM-ddTHH-mm-ssZ" ] |]
+            [| mdict [ "status", box "blocked"; "score", box 0.0; "error", box "cycle must be a non-negative integer id or filename-safe UTC form yyyy-MM-ddTHH-mm-ssZ" ] |]
         elif paragraphs.Length = 0 then
             [| mdict [ "status", box "blocked"; "score", box 0.0; "error", box "no knowledge-like paragraphs found" ] |]
         else
-            let plannedWrites = ResizeArray<int * string * Frontmatter * string * string option * string[]>()
-            let results = ResizeArray<Dictionary<string, obj>>()
+            let cycle = normalizedCycle |> Option.defaultValue cycle
+            match Config.resolveInboxDir cfg with
+            | Error error ->
+                [| mdict [ "status", box "blocked"; "score", box 0.0; "error", box error ] |]
+            | Ok inboxDir ->
+                let plannedWrites = ResizeArray<int * string * Frontmatter * string * string option * string[]>()
+                let results = ResizeArray<Dictionary<string, obj>>()
 
-            for paragraph in paragraphs do
-                let signal = knowledgeSignal paragraph index
-                let placement = writePipelinePlacement cfg index chunks cfg.EmbeddingUrl paragraph 3
-                let suggestedPath = placement |> Array.tryHead |> Option.map (fun (filePath, _, _) -> relativeRepoPath cfg.RepoRoot filePath)
-                let placementFile = placement |> Array.tryHead |> Option.map (fun (filePath, _, _) -> filePath)
-                let nearest = rankedSubsetMatches index chunks cfg.EmbeddingUrl (isWriteCanonicalFile cfg index) paragraph 1
-                let nearestIndex, nearestScore =
-                    if nearest.Length > 0 then
-                        let i, score = nearest.[0]
-                        Some i, score
+                for paragraph in paragraphs do
+                    let signal = knowledgeSignal paragraph index
+                    let placement = writePipelinePlacement cfg index chunks cfg.EmbeddingUrl paragraph 3
+                    let placementPaths = placement |> Array.map (fun (filePath, _, _) -> filePath)
+                    let suggestedPath = placement |> Array.tryHead |> Option.map (fun (filePath, _, _) -> relativeRepoPath cfg.RepoRoot filePath)
+                    let nearest = rankedSubsetMatches index chunks cfg.EmbeddingUrl (isWriteCanonicalFile cfg index) paragraph 1
+                    let nearestIndex, nearestScore =
+                        if nearest.Length > 0 then
+                            let i, score = nearest.[0]
+                            Some i, score
+                        else
+                            None, 0.0
+
+                    let allowShortClaim = signal < 1 && allowShortProposeClaim paragraph
+
+                    if signal < 1 && not allowShortClaim then
+                        results.Add(mdict [
+                            "status", box "blocked"
+                            "score", box (Math.Round(nearestScore, 3))
+                            "paragraph", box (titleFromText paragraph)
+                            "reason", box "paragraph does not look knowledge-like enough to file"
+                        ])
+                    elif nearestScore >= threshold then
+                        let nearestRef =
+                            nearestIndex
+                            |> Option.map session.NextRef
+                            |> Option.defaultValue ""
+                        results.Add(mdict [
+                            "status", box "known"
+                            "score", box (Math.Round(nearestScore, 3))
+                            "nearest", box nearestRef
+                            "suggestedTarget", box (suggestedPath |> Option.defaultValue "")
+                            "paragraph", box (titleFromText paragraph)
+                        ])
                     else
-                        None, 0.0
+                        let title = titleFromText paragraph
+                        let slug = slugify title
+                        let inboxDirectory = Path.Combine(cfg.RepoRoot, inboxDir, normalizedTeam)
+                        let plannedPath = nextAvailablePath (Path.Combine(inboxDirectory, sprintf "%s-%s.md" cycle slug))
+                        let suggestedVerify =
+                            if String.IsNullOrWhiteSpace(verify) then synthesizeVerify index paragraph placementPaths
+                            else None
+                        let frontmatter = createInboxFrontmatter title normalizedTeam cycle confidence concept verify observable forbids (suggestedPath |> Option.defaultValue "")
+                        let missingFields = missingRequiredFields cfg frontmatter
+                        let warnings = missingFields |> Array.map (fun field -> "no_" + field)
 
-                if signal < 1 then
-                    results.Add(mdict [
-                        "status", box "blocked"
-                        "score", box (Math.Round(nearestScore, 3))
-                        "paragraph", box (titleFromText paragraph)
-                        "reason", box "paragraph does not look knowledge-like enough to file"
-                    ])
-                elif nearestScore >= threshold then
-                    let nearestRef =
-                        nearestIndex
-                        |> Option.map session.NextRef
-                        |> Option.defaultValue ""
-                    results.Add(mdict [
-                        "status", box "known"
-                        "score", box (Math.Round(nearestScore, 3))
-                        "nearest", box nearestRef
-                        "suggestedTarget", box (suggestedPath |> Option.defaultValue "")
-                        "paragraph", box (titleFromText paragraph)
-                    ])
-                else
-                    let title = titleFromText paragraph
-                    let slug = slugify title
-                    let inboxDirectory = Path.Combine(cfg.RepoRoot, cfg.InboxDir, normalizedTeam)
-                    let plannedPath = nextAvailablePath (Path.Combine(inboxDirectory, sprintf "%s-%s.md" cycle slug))
-                    let suggestedVerify =
-                        if String.IsNullOrWhiteSpace(verify) then synthesizeVerify index paragraph placementFile
-                        else None
-                    let frontmatter = createInboxFrontmatter title normalizedTeam cycle confidence concept verify observable forbids (suggestedPath |> Option.defaultValue "")
-                    let missingFields = missingRequiredFields cfg frontmatter
-                    let warnings = missingFields |> Array.map (fun field -> "no_" + field)
-
-                    if requireFieldsError && missingFields.Length > 0 then
-                        let blockedResult =
-                            mdict [
-                                "status", box "blocked"
-                                "score", box (Math.Round(nearestScore, 3))
-                                "suggestedTarget", box (suggestedPath |> Option.defaultValue "")
-                                "warnings", box warnings
-                                "missing", box missingFields
-                                "paragraph", box title
-                                "reason", box (sprintf "missing required fields: %s" (String.concat ", " missingFields))
-                            ]
-                        suggestedVerify |> Option.iter (fun value -> blockedResult.["suggestedVerify"] <- box value)
-                        results.Add(blockedResult)
-                    elif dryRun then
-                        let dryRunResult =
-                            mdict [
+                        if requireFieldsError && missingFields.Length > 0 then
+                            let blockedResult =
+                                mdict [
+                                    "status", box "blocked"
+                                    "score", box (Math.Round(nearestScore, 3))
+                                    "suggestedTarget", box (suggestedPath |> Option.defaultValue "")
+                                    "warnings", box warnings
+                                    "missing", box missingFields
+                                    "paragraph", box title
+                                    "reason", box (sprintf "missing required fields: %s" (String.concat ", " missingFields))
+                                ]
+                            suggestedVerify |> Option.iter (fun value -> blockedResult.["suggestedVerify"] <- box value)
+                            results.Add(blockedResult)
+                        elif dryRun then
+                            let dryRunResult =
+                                mdict [
+                                    "status", box "filed"
+                                    "score", box (Math.Round(nearestScore, 3))
+                                    "inboxPath", box (relativeRepoPath cfg.RepoRoot plannedPath)
+                                    "suggestedTarget", box (suggestedPath |> Option.defaultValue "")
+                                    "warnings", box warnings
+                                    "paragraph", box title
+                                ]
+                            suggestedVerify |> Option.iter (fun value -> dryRunResult.["suggestedVerify"] <- box value)
+                            results.Add(dryRunResult)
+                        else
+                            let resultIndex = results.Count
+                            plannedWrites.Add(resultIndex, plannedPath, frontmatter, paragraph, suggestedVerify, warnings)
+                            results.Add(mdict [
                                 "status", box "filed"
                                 "score", box (Math.Round(nearestScore, 3))
                                 "inboxPath", box (relativeRepoPath cfg.RepoRoot plannedPath)
                                 "suggestedTarget", box (suggestedPath |> Option.defaultValue "")
                                 "warnings", box warnings
                                 "paragraph", box title
-                            ]
-                        suggestedVerify |> Option.iter (fun value -> dryRunResult.["suggestedVerify"] <- box value)
-                        results.Add(dryRunResult)
-                    else
-                        let resultIndex = results.Count
-                        plannedWrites.Add(resultIndex, plannedPath, frontmatter, paragraph, suggestedVerify, warnings)
-                        results.Add(mdict [
-                            "status", box "filed"
-                            "score", box (Math.Round(nearestScore, 3))
-                            "inboxPath", box (relativeRepoPath cfg.RepoRoot plannedPath)
-                            "suggestedTarget", box (suggestedPath |> Option.defaultValue "")
-                            "warnings", box warnings
-                            "paragraph", box title
-                        ])
+                            ])
 
-            if not dryRun && plannedWrites.Count > 0 then
-                for (_, path, frontmatter, body, _, _) in plannedWrites do
-                    writeMarkdownFile path frontmatter body
+                if not dryRun && plannedWrites.Count > 0 then
+                    for (_, path, frontmatter, body, _, _) in plannedWrites do
+                        writeMarkdownFile path frontmatter body
 
-                match IndexingWorkflow.rebuild cfg with
-                | Ok (updatedIndex, updatedChunks) ->
-                    refreshState updatedIndex updatedChunks
-                    for i in 0 .. plannedWrites.Count - 1 do
-                        let resultIndex, path, _, _, suggestedVerify, warnings = plannedWrites.[i]
-                        let result = results.[resultIndex]
-                        match primaryChunkIndexForFile updatedIndex path with
-                        | Some chunkIndex -> result.["ref"] <- box (session.NextRef(chunkIndex))
-                        | None -> ()
-                        result.["inboxPath"] <- box (relativeRepoPath cfg.RepoRoot path)
-                        result.["warnings"] <- box warnings
-                        suggestedVerify |> Option.iter (fun value -> result.["suggestedVerify"] <- box value)
-                | Error error ->
-                    for (resultIndex, _, _, _, _, _) in plannedWrites do
-                        results.[resultIndex].["status"] <- box "blocked"
-                        results.[resultIndex].["error"] <- box error
+                    match IndexingWorkflow.rebuild cfg with
+                    | Ok (updatedIndex, updatedChunks) ->
+                        refreshState updatedIndex updatedChunks
+                        for i in 0 .. plannedWrites.Count - 1 do
+                            let resultIndex, path, _, _, suggestedVerify, warnings = plannedWrites.[i]
+                            let result = results.[resultIndex]
+                            match primaryChunkIndexForFile updatedIndex path with
+                            | Some chunkIndex -> result.["ref"] <- box (session.NextRef(chunkIndex))
+                            | None -> ()
+                            result.["inboxPath"] <- box (relativeRepoPath cfg.RepoRoot path)
+                            result.["warnings"] <- box warnings
+                            suggestedVerify |> Option.iter (fun value -> result.["suggestedVerify"] <- box value)
+                    | Error error ->
+                        for (resultIndex, _, _, _, _, _) in plannedWrites do
+                            results.[resultIndex].["status"] <- box "blocked"
+                            results.[resultIndex].["error"] <- box error
 
-            results.ToArray()
+                results.ToArray()
 
     let triage (index: DocIndex) (session: QuerySession) (cfg: KnowledgeSightConfig) (team: string) (before: string) (limit: int) =
-        let requestedTeam = normalizeTeam team
-        index.Frontmatters
-        |> Map.toArray
-        |> Array.choose (fun (path, frontmatter) ->
-            if not (isPendingInboxFile cfg path frontmatter) then None
+        match Config.resolveInboxDir cfg with
+        | Error error -> [| mdict [ "error", box error ] |]
+        | Ok _ ->
+            let requestedTeam = normalizeTeam team
+            let pendingRows =
+                index.Frontmatters
+                |> Map.toArray
+                |> Array.choose (fun (path, frontmatter) ->
+                    if not (isPendingInboxFile cfg index path frontmatter) then None
+                    else
+                        let source = frontmatterScalar frontmatter "source" |> Option.defaultValue ""
+                        let includeTeam = requestedTeam = "" || source.Equals(requestedTeam, StringComparison.OrdinalIgnoreCase)
+                        if not includeTeam then None
+                        else
+                            let cycle = frontmatterScalar frontmatter "cycle" |> Option.defaultValue ""
+                            Some(path, frontmatter, source, cycle))
+
+            let cycleForms =
+                pendingRows
+                |> Array.choose (fun (_, _, _, cycle) -> cycleFormName cycle)
+                |> Set.ofArray
+
+            if before <> "" && cycleForms.Contains "utc" && cycleForms.Contains "integer" then
+                [| mdict [ "error", box "triage({before}) cannot page mixed UTC-string and integer cycle inbox items honestly in this wave; normalize the inbox to one cycle form or omit before" ] |]
             else
-                let source = frontmatterScalar frontmatter "source" |> Option.defaultValue ""
-                let cycle = frontmatterScalar frontmatter "cycle" |> Option.defaultValue ""
-                let includeTeam = requestedTeam = "" || source.Equals(requestedTeam, StringComparison.OrdinalIgnoreCase)
-                let includeBefore = before = "" || String.Compare(cycle, before, StringComparison.OrdinalIgnoreCase) <= 0
-                if not includeTeam || not includeBefore then None
-                else
-                    let missing = missingRequiredFields cfg frontmatter
-                    primaryChunkIndexForFile index path
-                    |> Option.map (fun chunkIndex ->
-                        let refId = session.NextRef(chunkIndex)
-                        let relativePath = relativeRepoPath cfg.RepoRoot path
-                        let suggestedTarget = frontmatterScalar frontmatter "suggested_target" |> Option.defaultValue ""
-                        mdict [
-                            "id", box refId
-                            "file", box (Path.GetFileName path)
-                            "path", box relativePath
-                            "title", box frontmatter.Title
-                            "cycle", box cycle
-                            "source", box source
-                            "suggestedTarget", box suggestedTarget
-                            "age", box (humanizeAge cycle)
-                            "missing", box missing
-                        ]))
-        |> Array.sortBy (fun item -> string item.["cycle"], string item.["path"])
-        |> Array.truncate (max 1 limit)
+                pendingRows
+                |> Array.choose (fun (path, frontmatter, source, cycle) ->
+                    let includeBefore = before = "" || cycleOnOrBefore cycle before
+                    if not includeBefore then None
+                    else
+                        let missing = missingRequiredFields cfg frontmatter
+                        primaryChunkIndexForFile index path
+                        |> Option.map (fun chunkIndex ->
+                            let refId = session.NextRef(chunkIndex)
+                            let relativePath = relativeRepoPath cfg.RepoRoot path
+                            let suggestedTarget = frontmatterScalar frontmatter "suggested_target" |> Option.defaultValue ""
+                            mdict [
+                                "id", box refId
+                                "file", box (Path.GetFileName path)
+                                "path", box relativePath
+                                "title", box frontmatter.Title
+                                "cycle", box cycle
+                                "source", box source
+                                "suggestedTarget", box suggestedTarget
+                                "age", box (humanizeAge cycle)
+                                "missing", box missing
+                            ]))
+                |> Array.sortWith (fun left right ->
+                    let cycleComparison = compareCycleValues (string left.["cycle"]) (string right.["cycle"])
+                    if cycleComparison <> 0 then cycleComparison
+                    else String.Compare(string left.["path"], string right.["path"], StringComparison.OrdinalIgnoreCase))
+                |> Array.truncate (max 1 limit)
 
     let dispose (index: DocIndex) (session: QuerySession) (cfg: KnowledgeSightConfig) (refreshState: DocIndex -> DocChunk[] option -> unit)
                 (inboxRef: string) (action: string) (target: string) (verify: string) (concept: string) (observable: string) (forbids: string) (reason: string) (archive: bool) =
-        match session.GetRef(inboxRef) with
-        | None -> mdict [ "error", box (sprintf "ref %s not found" inboxRef) ]
-        | Some chunkIndex ->
-            let sourceChunk = index.Chunks.[chunkIndex]
-            let inboxPath = sourceChunk.FilePath
-            match frontmatterForFile index inboxPath with
-            | None -> mdict [ "error", box (sprintf "frontmatter not found for %s" inboxPath) ]
-            | Some inboxFrontmatter when not (isPendingInboxFile cfg inboxPath inboxFrontmatter) ->
-                mdict [ "error", box (sprintf "%s is not an inbox item awaiting disposition" (relativeRepoPath cfg.RepoRoot inboxPath)) ]
-            | Some inboxFrontmatter ->
-                let inboxBaselineContent, _, inboxBody = readMarkdownFile inboxPath
+        match Config.resolveInboxDir cfg with
+        | Error error -> mdict [ "error", box error ]
+        | Ok inboxDir ->
+            match session.GetRef(inboxRef) with
+            | None -> mdict [ "error", box (sprintf "ref %s not found" inboxRef) ]
+            | Some chunkIndex ->
+                let sourceChunk = index.Chunks.[chunkIndex]
+                let inboxPath = sourceChunk.FilePath
+                match frontmatterForFile index inboxPath with
+                | None -> mdict [ "error", box (sprintf "frontmatter not found for %s" inboxPath) ]
+                | Some inboxFrontmatter when not (isPendingInboxFile cfg index inboxPath inboxFrontmatter) ->
+                    mdict [ "error", box (sprintf "%s is not an inbox item awaiting disposition" (relativeRepoPath cfg.RepoRoot inboxPath)) ]
+                | Some inboxFrontmatter ->
+                    let inboxBaselineContent, _, inboxBody = readMarkdownFile inboxPath
 
-                let cycle = frontmatterScalar inboxFrontmatter "cycle" |> Option.defaultValue ""
-                let source = frontmatterScalar inboxFrontmatter "source" |> Option.defaultValue ""
-                let relativeInboxPath = relativeRepoPath cfg.RepoRoot inboxPath
+                    let cycle = frontmatterScalar inboxFrontmatter "cycle" |> Option.defaultValue ""
+                    let source = frontmatterScalar inboxFrontmatter "source" |> Option.defaultValue ""
+                    let relativeInboxPath = relativeRepoPath cfg.RepoRoot inboxPath
 
-                let archiveInbox (updatedFrontmatter: Frontmatter) =
-                    if archive then
-                        let destinationDir = Path.Combine(cfg.RepoRoot, cfg.InboxDir, "_processed", cycle)
-                        let destinationPath = nextAvailablePath (Path.Combine(destinationDir, Path.GetFileName(inboxPath)))
-                        writeMarkdownFile destinationPath updatedFrontmatter inboxBody
-                        if File.Exists inboxPath then File.Delete(inboxPath)
-                        Ok (relativeRepoPath cfg.RepoRoot destinationPath)
-                    else
-                        if File.Exists inboxPath then File.Delete(inboxPath)
-                        Ok ""
+                    let archiveInbox (updatedFrontmatter: Frontmatter) =
+                        if archive then
+                            let destinationDir = Path.Combine(cfg.RepoRoot, inboxDir, "_processed", cycle)
+                            let destinationPath = nextAvailablePath (Path.Combine(destinationDir, Path.GetFileName(inboxPath)))
+                            writeMarkdownFile destinationPath updatedFrontmatter inboxBody
+                            if File.Exists inboxPath then File.Delete(inboxPath)
+                            Ok (relativeRepoPath cfg.RepoRoot destinationPath)
+                        else
+                            if File.Exists inboxPath then File.Delete(inboxPath)
+                            Ok ""
 
-                match action.Trim().ToLowerInvariant() with
-                | "promote" ->
-                    if String.IsNullOrWhiteSpace(target) then
-                        mdict [ "error", box "dispose(promote) requires an explicit target" ]
-                    else
-                        match resolveRepoRelativePath cfg target with
+                    match action.Trim().ToLowerInvariant() with
+                    | "promote" ->
+                        if String.IsNullOrWhiteSpace(target) then
+                            mdict [ "error", box "dispose(promote) requires an explicit target" ]
+                        else
+                            match resolveRepoRelativePath cfg target with
+                            | Error error -> mdict [ "error", box error ]
+                            | Ok targetPath ->
+                                let actualTarget =
+                                    if File.Exists targetPath then
+                                        match cfg.PromoteCollision.Trim().ToLowerInvariant() with
+                                        | "error" -> ""
+                                        | _ -> nextAvailablePath targetPath
+                                    else targetPath
+
+                                if actualTarget = "" then
+                                    mdict [ "error", box (sprintf "target '%s' already exists and promoteCollision is 'error'" target) ]
+                                else
+                                    let targetSnapshot = captureFileSnapshot actualTarget
+                                    let canonicalFrontmatter =
+                                        inboxFrontmatter
+                                        |> removeFrontmatterFields [| "suggested_target"; "disposition"; "disposition_target"; "disposition_reason"; "verify_snapshot"; verifySearchCacheField |]
+                                        |> fun fm -> { fm with Status = "active" }
+                                        |> setFrontmatterScalarIfAny "verify" verify
+                                        |> setFrontmatterScalarIfAny "concept" concept
+                                        |> setFrontmatterScalarIfAny "observable" observable
+                                        |> setFrontmatterScalarIfAny "forbids" forbids
+                                        |> fun fm -> if String.IsNullOrWhiteSpace(fm.Title) then { fm with Title = titleFromText inboxBody } else fm
+
+                                    writeMarkdownFile actualTarget canonicalFrontmatter inboxBody
+
+                                    let updatedInboxFrontmatter =
+                                        inboxFrontmatter
+                                        |> setFrontmatterField "disposition" (Scalar "promoted")
+                                        |> setFrontmatterField "disposition_target" (Scalar (relativeRepoPath cfg.RepoRoot actualTarget))
+
+                                    match archiveInbox updatedInboxFrontmatter with
+                                    | Error error -> mdict [ "error", box error ]
+                                    | Ok archivedPath ->
+                                        match IndexingWorkflow.rebuild cfg with
+                                        | Error error -> mdict [ "error", box error ]
+                                        | Ok (updatedIndex, updatedChunks) ->
+                                            match maybePersistVerifySnapshot cfg updatedIndex updatedChunks actualTarget with
+                                            | Error error ->
+                                                rollbackWriteSeamFailure cfg refreshState index None (fun () ->
+                                                    restoreFileSnapshot actualTarget targetSnapshot
+                                                    restoreFileSnapshot inboxPath (Some inboxBaselineContent)
+                                                    if archivedPath <> "" then
+                                                        restoreFileSnapshot (absoluteRepoPath cfg.RepoRoot archivedPath) None) error
+                                            | Ok (finalIndex, finalChunks) ->
+                                                refreshState finalIndex finalChunks
+                                                let canonicalRef =
+                                                    primaryChunkIndexForFile finalIndex actualTarget
+                                                    |> Option.map session.NextRef
+                                                    |> Option.defaultValue ""
+                                                mdict [
+                                                    "ref", box inboxRef
+                                                    "action", box "promote"
+                                                    "source", box source
+                                                    "path", box relativeInboxPath
+                                                    "target", box (relativeRepoPath cfg.RepoRoot actualTarget)
+                                                    "canonicalRef", box canonicalRef
+                                                    "archivedPath", box archivedPath
+                                                ]
+                    | "merge" ->
+                        match resolveMergeTargetPath cfg index target with
                         | Error error -> mdict [ "error", box error ]
                         | Ok targetPath ->
-                            let actualTarget =
-                                if File.Exists targetPath then
-                                    match cfg.PromoteCollision.Trim().ToLowerInvariant() with
-                                    | "error" -> ""
-                                    | _ -> nextAvailablePath targetPath
-                                else targetPath
+                            try
+                                let baselineContent, targetFrontmatter, targetBody = readMarkdownFile targetPath
+                                let targetSnapshot = Some baselineContent
+                                let _, marker, block = mergeBlock relativeInboxPath source cycle inboxBody
+                                let updatedBody = appendMergeBlock targetBody block
+                                let updatedContent = renderMarkdownContent targetFrontmatter updatedBody
 
-                            if actualTarget = "" then
-                                mdict [ "error", box (sprintf "target '%s' already exists and promoteCollision is 'error'" target) ]
-                            else
-                                let targetSnapshot = captureFileSnapshot actualTarget
-                                let canonicalFrontmatter =
-                                    inboxFrontmatter
-                                    |> removeFrontmatterFields [| "suggested_target"; "disposition"; "disposition_target"; "disposition_reason"; "verify_snapshot"; verifySearchCacheField |]
-                                    |> fun fm -> { fm with Status = "active" }
-                                    |> setFrontmatterScalarIfAny "verify" verify
-                                    |> setFrontmatterScalarIfAny "concept" concept
-                                    |> setFrontmatterScalarIfAny "observable" observable
-                                    |> setFrontmatterScalarIfAny "forbids" forbids
-                                    |> fun fm -> if String.IsNullOrWhiteSpace(fm.Title) then { fm with Title = titleFromText inboxBody } else fm
+                                match commitMergeContent targetPath baselineContent updatedContent marker with
+                                | MergeConflict error ->
+                                    mdict [ "error", box error ]
+                                | commitOutcome ->
+                                    let updatedInboxFrontmatter =
+                                        inboxFrontmatter
+                                        |> setFrontmatterField "disposition" (Scalar "merged")
+                                        |> setFrontmatterField "disposition_target" (Scalar (relativeRepoPath cfg.RepoRoot targetPath))
 
-                                writeMarkdownFile actualTarget canonicalFrontmatter inboxBody
-
-                                let updatedInboxFrontmatter =
-                                    inboxFrontmatter
-                                    |> setFrontmatterField "disposition" (Scalar "promoted")
-                                    |> setFrontmatterField "disposition_target" (Scalar (relativeRepoPath cfg.RepoRoot actualTarget))
-
-                                match archiveInbox updatedInboxFrontmatter with
-                                | Error error -> mdict [ "error", box error ]
-                                | Ok archivedPath ->
-                                    match IndexingWorkflow.rebuild cfg with
+                                    match archiveInbox updatedInboxFrontmatter with
                                     | Error error -> mdict [ "error", box error ]
-                                    | Ok (updatedIndex, updatedChunks) ->
-                                        match maybePersistVerifySnapshot cfg updatedIndex updatedChunks actualTarget with
-                                        | Error error ->
-                                            rollbackWriteSeamFailure cfg refreshState index None (fun () ->
-                                                restoreFileSnapshot actualTarget targetSnapshot
-                                                restoreFileSnapshot inboxPath (Some inboxBaselineContent)
-                                                if archivedPath <> "" then
-                                                    restoreFileSnapshot (absoluteRepoPath cfg.RepoRoot archivedPath) None) error
-                                        | Ok (finalIndex, finalChunks) ->
-                                            refreshState finalIndex finalChunks
-                                            let canonicalRef =
-                                                primaryChunkIndexForFile finalIndex actualTarget
-                                                |> Option.map session.NextRef
-                                                |> Option.defaultValue ""
-                                            mdict [
-                                                "ref", box inboxRef
-                                                "action", box "promote"
-                                                "source", box source
-                                                "path", box relativeInboxPath
-                                                "target", box (relativeRepoPath cfg.RepoRoot actualTarget)
-                                                "canonicalRef", box canonicalRef
-                                                "archivedPath", box archivedPath
-                                            ]
-                | "merge" ->
-                    match resolveMergeTargetPath cfg index target with
-                    | Error error -> mdict [ "error", box error ]
-                    | Ok targetPath ->
-                        try
-                            let baselineContent, targetFrontmatter, targetBody = readMarkdownFile targetPath
-                            let targetSnapshot = Some baselineContent
-                            let _, marker, block = mergeBlock relativeInboxPath source cycle inboxBody
-                            let updatedBody = appendMergeBlock targetBody block
-                            let updatedContent = renderMarkdownContent targetFrontmatter updatedBody
+                                    | Ok archivedPath ->
+                                        match IndexingWorkflow.rebuild cfg with
+                                        | Error error -> mdict [ "error", box error ]
+                                        | Ok (updatedIndex, updatedChunks) ->
+                                            match maybePersistVerifySnapshot cfg updatedIndex updatedChunks targetPath with
+                                            | Error error ->
+                                                rollbackWriteSeamFailure cfg refreshState index None (fun () ->
+                                                    restoreFileSnapshot targetPath targetSnapshot
+                                                    restoreFileSnapshot inboxPath (Some inboxBaselineContent)
+                                                    if archivedPath <> "" then
+                                                        restoreFileSnapshot (absoluteRepoPath cfg.RepoRoot archivedPath) None) error
+                                            | Ok (finalIndex, finalChunks) ->
+                                                refreshState finalIndex finalChunks
+                                                let canonicalRef =
+                                                    primaryChunkIndexForFile finalIndex targetPath
+                                                    |> Option.map session.NextRef
+                                                    |> Option.defaultValue ""
+                                                mdict [
+                                                    "ref", box inboxRef
+                                                    "action", box "merge"
+                                                    "source", box source
+                                                    "path", box relativeInboxPath
+                                                    "target", box (relativeRepoPath cfg.RepoRoot targetPath)
+                                                    "canonicalRef", box canonicalRef
+                                                    "archivedPath", box archivedPath
+                                                    "deduped", box (match commitOutcome with | MergeAlreadyPresent -> true | _ -> false)
+                                                ]
+                            with
+                            | :? IOException ->
+                                mdict [ "error", box "dispose(merge) target changed concurrently before commit; retry against the latest canonical doc" ]
+                    | "reject" ->
+                        if String.IsNullOrWhiteSpace(reason) then
+                            mdict [ "error", box "dispose(reject) requires a reason" ]
+                        else
+                            let updatedInboxFrontmatter =
+                                inboxFrontmatter
+                                |> setFrontmatterField "disposition" (Scalar "rejected")
+                                |> setFrontmatterField "disposition_reason" (Scalar reason)
 
-                            match commitMergeContent targetPath baselineContent updatedContent marker with
-                            | MergeConflict error ->
-                                mdict [ "error", box error ]
-                            | commitOutcome ->
-                                let updatedInboxFrontmatter =
-                                    inboxFrontmatter
-                                    |> setFrontmatterField "disposition" (Scalar "merged")
-                                    |> setFrontmatterField "disposition_target" (Scalar (relativeRepoPath cfg.RepoRoot targetPath))
-
-                                match archiveInbox updatedInboxFrontmatter with
-                                | Error error -> mdict [ "error", box error ]
-                                | Ok archivedPath ->
-                                    match IndexingWorkflow.rebuild cfg with
-                                    | Error error -> mdict [ "error", box error ]
-                                    | Ok (updatedIndex, updatedChunks) ->
-                                        match maybePersistVerifySnapshot cfg updatedIndex updatedChunks targetPath with
-                                        | Error error ->
-                                            rollbackWriteSeamFailure cfg refreshState index None (fun () ->
-                                                restoreFileSnapshot targetPath targetSnapshot
-                                                restoreFileSnapshot inboxPath (Some inboxBaselineContent)
-                                                if archivedPath <> "" then
-                                                    restoreFileSnapshot (absoluteRepoPath cfg.RepoRoot archivedPath) None) error
-                                        | Ok (finalIndex, finalChunks) ->
-                                            refreshState finalIndex finalChunks
-                                            let canonicalRef =
-                                                primaryChunkIndexForFile finalIndex targetPath
-                                                |> Option.map session.NextRef
-                                                |> Option.defaultValue ""
-                                            mdict [
-                                                "ref", box inboxRef
-                                                "action", box "merge"
-                                                "source", box source
-                                                "path", box relativeInboxPath
-                                                "target", box (relativeRepoPath cfg.RepoRoot targetPath)
-                                                "canonicalRef", box canonicalRef
-                                                "archivedPath", box archivedPath
-                                                "deduped", box (match commitOutcome with | MergeAlreadyPresent -> true | _ -> false)
-                                            ]
-                        with
-                        | :? IOException ->
-                            mdict [ "error", box "dispose(merge) target changed concurrently before commit; retry against the latest canonical doc" ]
-                | "reject" ->
-                    if String.IsNullOrWhiteSpace(reason) then
-                        mdict [ "error", box "dispose(reject) requires a reason" ]
-                    else
-                        let updatedInboxFrontmatter =
-                            inboxFrontmatter
-                            |> setFrontmatterField "disposition" (Scalar "rejected")
-                            |> setFrontmatterField "disposition_reason" (Scalar reason)
-
-                        match archiveInbox updatedInboxFrontmatter with
-                        | Error error -> mdict [ "error", box error ]
-                        | Ok archivedPath ->
-                            match IndexingWorkflow.rebuild cfg with
+                            match archiveInbox updatedInboxFrontmatter with
                             | Error error -> mdict [ "error", box error ]
-                            | Ok (updatedIndex, updatedChunks) ->
-                                refreshState updatedIndex updatedChunks
-                                mdict [
-                                    "ref", box inboxRef
-                                    "action", box "reject"
-                                    "source", box source
-                                    "path", box relativeInboxPath
-                                    "archivedPath", box archivedPath
-                                ]
-                | _ ->
-                    mdict [ "error", box "dispose action must be 'promote', 'merge', or 'reject'" ]
+                            | Ok archivedPath ->
+                                match IndexingWorkflow.rebuild cfg with
+                                | Error error -> mdict [ "error", box error ]
+                                | Ok (updatedIndex, updatedChunks) ->
+                                    refreshState updatedIndex updatedChunks
+                                    mdict [
+                                        "ref", box inboxRef
+                                        "action", box "reject"
+                                        "source", box source
+                                        "path", box relativeInboxPath
+                                        "archivedPath", box archivedPath
+                                    ]
+                    | _ ->
+                        mdict [ "error", box "dispose action must be 'promote', 'merge', or 'reject'" ]
 
     let supersede (index: DocIndex) (session: QuerySession) (cfg: KnowledgeSightConfig) (refreshState: DocIndex -> DocChunk[] option -> unit)
                   (oldRef: string) (newContent: string) (reason: string) (by: string) (verify: string) =
@@ -3571,137 +3692,140 @@ module Primitives =
                 | Ok verdictFilters when noConflict && Array.contains "conflict" verdictFilters ->
                     [| mdict [ "error", box "conflicts({noConflict:true}) in this wave allows verdicts:[...] only within duplicate|compatible so conflict-bearing visible filtering stays rejected" ] |]
                 | Ok verdictFilters ->
-                    let allConflictDocs = conflictScopeDocs cfg index
-                    let docs = allConflictDocs |> Array.choose (conflictCandidateDocFromScopeDoc index session)
-                    let docsByPath = Dictionary<string, ConflictDoc>(StringComparer.OrdinalIgnoreCase)
-                    for doc in docs do
-                        docsByPath.[doc.RelativePath] <- doc
-                    let supportedDocs = docs |> Array.filter (fun doc -> doc.IsSupported)
-                    let supportedScopeDocs = allConflictDocs |> Array.filter (fun doc -> doc.IsSupported)
-                    let allowedScopeRoots = Array.append cfg.DocDirs [| cfg.InboxDir |] |> Array.distinct
+                    match Config.scanDocDirs cfg with
+                    | Error error ->
+                        [| mdict [ "error", box error ] |]
+                    | Ok allowedScopeRoots ->
+                        let allConflictDocs = conflictScopeDocs cfg index
+                        let docs = allConflictDocs |> Array.choose (conflictCandidateDocFromScopeDoc index session)
+                        let docsByPath = Dictionary<string, ConflictDoc>(StringComparer.OrdinalIgnoreCase)
+                        for doc in docs do
+                            docsByPath.[doc.RelativePath] <- doc
+                        let supportedDocs = docs |> Array.filter (fun doc -> doc.IsSupported)
+                        let supportedScopeDocs = allConflictDocs |> Array.filter (fun doc -> doc.IsSupported)
 
-                    let resolvedDocsOrErrors =
-                        if scope.Length = 0 then
-                            if supportedScopeDocs.Length > 0 && supportedDocs.Length = 0 then
-                                Error [| mdict [ "error", box conflictsSemanticUnavailableError ] |]
-                            else
-                                Ok supportedDocs
-                        else
-                            let selectorErrors = ResizeArray<Dictionary<string, obj>>()
-                            let selectedDocs = Dictionary<string, ConflictDoc>(StringComparer.OrdinalIgnoreCase)
-    
-                            for requested in scope do
-                                let rawSelector = if isNull requested then "" else requested
-                                let trimmed = rawSelector.Trim()
-                                let normalized = normalizeScopeSelector trimmed
-    
-                                let error message =
-                                    selectorErrors.Add(mdict [ "selector", box rawSelector; "error", box message ])
-    
-                                if trimmed = "" then
-                                    error "conflicts() scope selectors must be non-empty repo-relative paths or globs in this wave"
-                                elif Path.IsPathRooted(trimmed) then
-                                    error "conflicts() scope selectors must be repo-relative paths or globs in this wave"
-                                elif Regex.IsMatch(normalized, @"^R\d+$") then
-                                    error "conflicts() scope selectors must not use session-scoped R# refs in this wave"
+                        let resolvedDocsOrErrors =
+                            if scope.Length = 0 then
+                                if supportedScopeDocs.Length > 0 && supportedDocs.Length = 0 then
+                                    Error [| mdict [ "error", box conflictsSemanticUnavailableError ] |]
                                 else
-                                    let selectorRoot = scopeSelectorRoot normalized
-                                    if not (isSelectorUnderAllowedDirs allowedScopeRoots selectorRoot) then
-                                        error "conflicts() scope selectors must stay under configured knowledge doc dirs or inbox in this wave"
+                                    Ok supportedDocs
+                            else
+                                let selectorErrors = ResizeArray<Dictionary<string, obj>>()
+                                let selectedDocs = Dictionary<string, ConflictDoc>(StringComparer.OrdinalIgnoreCase)
+
+                                for requested in scope do
+                                    let rawSelector = if isNull requested then "" else requested
+                                    let trimmed = rawSelector.Trim()
+                                    let normalized = normalizeScopeSelector trimmed
+
+                                    let error message =
+                                        selectorErrors.Add(mdict [ "selector", box rawSelector; "error", box message ])
+
+                                    if trimmed = "" then
+                                        error "conflicts() scope selectors must be non-empty repo-relative paths or globs in this wave"
+                                    elif Path.IsPathRooted(trimmed) then
+                                        error "conflicts() scope selectors must be repo-relative paths or globs in this wave"
+                                    elif Regex.IsMatch(normalized, @"^R\d+$") then
+                                        error "conflicts() scope selectors must not use session-scoped R# refs in this wave"
                                     else
-                                        let matches =
-                                            if scopeSelectorHasWildcard normalized then
-                                                let matcher = scopeSelectorRegex normalized
-                                                allConflictDocs
-                                                |> Array.filter (fun doc -> matcher.IsMatch(doc.ScopePath))
-                                            else
-                                                let normalizedExact = normalized.TrimEnd('/')
-                                                let exactMatches =
-                                                    allConflictDocs
-                                                    |> Array.filter (fun doc ->
-                                                        String.Equals(doc.ScopePath, normalizedExact, StringComparison.OrdinalIgnoreCase))
-                                                if exactMatches.Length > 0 then exactMatches
-                                                else
-                                                    allConflictDocs
-                                                    |> Array.filter (fun doc ->
-                                                        doc.ScopePath.StartsWith(normalizedExact + "/", StringComparison.OrdinalIgnoreCase))
-    
-                                        if matches.Length = 0 then
-                                            error (sprintf "conflicts() scope selector '%s' did not match any indexed docs in this wave" normalized)
+                                        let selectorRoot = scopeSelectorRoot normalized
+                                        if not (isSelectorUnderAllowedDirs allowedScopeRoots selectorRoot) then
+                                            error "conflicts() scope selectors must stay under configured knowledge doc dirs or inbox in this wave"
                                         else
-                                            let supportedMatches = matches |> Array.filter (fun doc -> doc.IsSupported)
-                                            let unsupportedMatches = matches |> Array.filter (fun doc -> not doc.IsSupported)
-    
-                                            if supportedMatches.Length = 0 then
-                                                error (sprintf "conflicts() scope selector '%s' did not match any supported pending inbox or active canonical docs in this wave" normalized)
-                                            elif unsupportedMatches.Length > 0 then
-                                                error (sprintf "conflicts() scope selector '%s' matched unsupported docs in this wave" normalized)
-                                            else
-                                                let supportedAnchoredMatches =
-                                                    supportedMatches
-                                                    |> Array.choose (fun doc ->
-                                                        match docsByPath.TryGetValue(doc.RelativePath) with
-                                                        | true, anchoredDoc -> Some anchoredDoc
-                                                        | _ -> None)
-
-                                                if supportedAnchoredMatches.Length = 0 then
-                                                    error (conflictsScopeSemanticUnavailableError normalized)
+                                            let matches =
+                                                if scopeSelectorHasWildcard normalized then
+                                                    let matcher = scopeSelectorRegex normalized
+                                                    allConflictDocs
+                                                    |> Array.filter (fun doc -> matcher.IsMatch(doc.ScopePath))
                                                 else
-                                                    supportedAnchoredMatches
-                                                    |> Array.iter (fun doc ->
-                                                        if not (selectedDocs.ContainsKey(doc.ScopePath)) then
-                                                            selectedDocs.[doc.ScopePath] <- doc)
+                                                    let normalizedExact = normalized.TrimEnd('/')
+                                                    let exactMatches =
+                                                        allConflictDocs
+                                                        |> Array.filter (fun doc ->
+                                                            String.Equals(doc.ScopePath, normalizedExact, StringComparison.OrdinalIgnoreCase))
+                                                    if exactMatches.Length > 0 then exactMatches
+                                                    else
+                                                        allConflictDocs
+                                                        |> Array.filter (fun doc ->
+                                                            doc.ScopePath.StartsWith(normalizedExact + "/", StringComparison.OrdinalIgnoreCase))
 
-                            if selectorErrors.Count > 0 then Error (selectorErrors.ToArray())
-                            else
-                                Ok (
-                                    selectedDocs.Values
-                                    |> Seq.sortBy (fun doc -> doc.RelativePath)
-                                    |> Seq.toArray)
-    
-                    match resolvedDocsOrErrors with
-                    | Error errors -> errors
-                    | Ok resolvedDocs when resolvedDocs.Length < 2 ->
-                        [||]
-                    | Ok resolvedDocs ->
-                        let candidates =
-                            resolvedDocs
-                            |> Array.map (fun doc -> doc.RelativePath, doc.Embedding)
-                            |> fun items -> greedyCluster items threshold
-                            |> Array.choose (fun memberPaths ->
-                                let members =
-                                    memberPaths
-                                    |> Array.choose (fun relativePath ->
-                                        match docsByPath.TryGetValue(relativePath) with
-                                        | true, doc -> Some doc
-                                        | _ -> None)
-                                    |> Array.sortBy (fun doc -> doc.RelativePath)
-    
-                                if members.Length < 2 then None
+                                            if matches.Length = 0 then
+                                                error (sprintf "conflicts() scope selector '%s' did not match any indexed docs in this wave" normalized)
+                                            else
+                                                let supportedMatches = matches |> Array.filter (fun doc -> doc.IsSupported)
+                                                let unsupportedMatches = matches |> Array.filter (fun doc -> not doc.IsSupported)
+
+                                                if supportedMatches.Length = 0 then
+                                                    error (sprintf "conflicts() scope selector '%s' did not match any supported pending inbox or active canonical docs in this wave" normalized)
+                                                elif unsupportedMatches.Length > 0 then
+                                                    error (sprintf "conflicts() scope selector '%s' matched unsupported docs in this wave" normalized)
+                                                else
+                                                    let supportedAnchoredMatches =
+                                                        supportedMatches
+                                                        |> Array.choose (fun doc ->
+                                                            match docsByPath.TryGetValue(doc.RelativePath) with
+                                                            | true, anchoredDoc -> Some anchoredDoc
+                                                            | _ -> None)
+
+                                                    if supportedAnchoredMatches.Length = 0 then
+                                                        error (conflictsScopeSemanticUnavailableError normalized)
+                                                    else
+                                                        supportedAnchoredMatches
+                                                        |> Array.iter (fun doc ->
+                                                            if not (selectedDocs.ContainsKey(doc.ScopePath)) then
+                                                                selectedDocs.[doc.ScopePath] <- doc)
+
+                                if selectorErrors.Count > 0 then Error (selectorErrors.ToArray())
                                 else
-                                    let similarity = conflictClusterSimilarity members
-                                    if similarity < threshold then None
+                                    Ok (
+                                        selectedDocs.Values
+                                        |> Seq.sortBy (fun doc -> doc.RelativePath)
+                                        |> Seq.toArray)
+
+                        match resolvedDocsOrErrors with
+                        | Error errors -> errors
+                        | Ok resolvedDocs when resolvedDocs.Length < 2 ->
+                            [||]
+                        | Ok resolvedDocs ->
+                            let candidates =
+                                resolvedDocs
+                                |> Array.map (fun doc -> doc.RelativePath, doc.Embedding)
+                                |> fun items -> greedyCluster items threshold
+                                |> Array.choose (fun memberPaths ->
+                                    let members =
+                                        memberPaths
+                                        |> Array.choose (fun relativePath ->
+                                            match docsByPath.TryGetValue(relativePath) with
+                                            | true, doc -> Some doc
+                                            | _ -> None)
+                                        |> Array.sortBy (fun doc -> doc.RelativePath)
+
+                                    if members.Length < 2 then None
                                     else
-                                        Some {
-                                            FirstPath = members.[0].RelativePath
-                                            Members = members
-                                            Similarity = similarity
-                                        })
-                            |> Array.sortBy (fun candidateData -> candidateData.FirstPath)
-    
-                        let rendered = ResizeArray<Dictionary<string, obj>>()
-                        let mutable failure = None
-    
-                        for candidateData in candidates do
-                            if failure.IsNone then
-                                match conflictCandidateItem cfg pairs judge rollup verdictFilters profileFilter profileFilters duplicatesOnly hasConflict mixedVerdicts compatibleOnly conflictOnly noConflict candidateData with
-                                | Ok (Some candidate) -> rendered.Add(candidate)
-                                | Ok None -> ()
-                                | Error message -> failure <- Some message
-    
-                        match failure with
-                        | Some message -> [| mdict [ "error", box message ] |]
-                        | None -> rendered.ToArray()
+                                        let similarity = conflictClusterSimilarity members
+                                        if similarity < threshold then None
+                                        else
+                                            Some {
+                                                FirstPath = members.[0].RelativePath
+                                                Members = members
+                                                Similarity = similarity
+                                            })
+                                |> Array.sortBy (fun candidateData -> candidateData.FirstPath)
+
+                            let rendered = ResizeArray<Dictionary<string, obj>>()
+                            let mutable failure = None
+
+                            for candidateData in candidates do
+                                if failure.IsNone then
+                                    match conflictCandidateItem cfg pairs judge rollup verdictFilters profileFilter profileFilters duplicatesOnly hasConflict mixedVerdicts compatibleOnly conflictOnly noConflict candidateData with
+                                    | Ok (Some candidate) -> rendered.Add(candidate)
+                                    | Ok None -> ()
+                                    | Error message -> failure <- Some message
+
+                            match failure with
+                            | Some message -> [| mdict [ "error", box message ] |]
+                            | None -> rendered.ToArray()
 
     /// Suggest subfolder groupings for docs in a directory.
     /// Uses embeddings to cluster docs by semantic similarity.
@@ -4310,7 +4434,7 @@ module Primitives =
         String.Equals(profile, "compaction", StringComparison.OrdinalIgnoreCase)
 
     let private compactionTrace (message: string) =
-        Console.Error.WriteLine(sprintf "[hygiene/compaction] %s" message)
+        CliOutput.info "[hygiene/compaction] %s" message
 
     let private compactionShortlistLimit (limit: int) =
         max 1 (min 25 limit)

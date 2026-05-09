@@ -15,137 +15,140 @@ module IndexingWorkflow =
 
     let rebuild (cfg: KnowledgeSightConfig) =
         let repo = cfg.RepoRoot
-        eprintfn "▶ Indexing docs in %s" repo
-        let docFiles = Config.findDocFiles cfg
-        eprintfn "  Found %d markdown files" docFiles.Length
+        CliOutput.info "▶ Indexing docs in %s" repo
+        match Config.findDocFiles cfg with
+        | Error error ->
+            Error error
+        | Ok docFiles ->
+            CliOutput.info "  Found %d markdown files" docFiles.Length
 
-        if docFiles.Length = 0 then
-            Error "No .md files found. Check docDirs in knowledge-sight.json."
-        else
-            let hashesPath = Path.Combine(cfg.IndexDir, "hashes.json")
-            let oldHashes = FileHashing.loadHashes hashesPath
-            let relFiles = docFiles |> Array.map (fun file -> Path.GetRelativePath(repo, file))
-            let changed, unchanged, removed, currentHashes = FileHashing.diffFiles relFiles oldHashes repo
-            let relToAbs = Array.zip relFiles docFiles |> Map.ofArray
-
-            if changed.Length = 0 && removed.Length = 0 then
-                eprintfn "Index is up to date (%d files, no changes)" docFiles.Length
-                match IndexStore.load cfg.IndexDir with
-                | Some index -> Ok (index, IndexStore.loadSourceChunks cfg.IndexDir)
-                | None -> Error "Index is up to date but no persisted index was found. Run `knowledge-sight index` again."
+            if docFiles.Length = 0 then
+                Error "No .md files found. Check docDirs in knowledge-sight.json."
             else
-                eprintfn "  Changed: %d, Unchanged: %d, Removed: %d" changed.Length unchanged.Length removed.Length
-                let unchangedSet = Set.ofArray unchanged
+                let hashesPath = Path.Combine(cfg.IndexDir, "hashes.json")
+                let oldHashes = FileHashing.loadHashes hashesPath
+                let relFiles = docFiles |> Array.map (fun file -> Path.GetRelativePath(repo, file))
+                let changed, unchanged, removed, currentHashes = FileHashing.diffFiles relFiles oldHashes repo
+                let relToAbs = Array.zip relFiles docFiles |> Map.ofArray
 
-                let changedAbs = changed |> Array.map (fun rel -> Map.find rel relToAbs)
-                eprintfn "▶ Parsing %d changed files..." changed.Length
-                let newChunks, newLinks, newFrontmatters = MarkdownChunker.chunkAll changedAbs repo
-                eprintfn "  %d chunks, %d links from changed files" newChunks.Length newLinks.Length
+                if changed.Length = 0 && removed.Length = 0 then
+                    CliOutput.info "Index is up to date (%d files, no changes)" docFiles.Length
+                    match IndexStore.load cfg.IndexDir with
+                    | Some index -> Ok (index, IndexStore.loadSourceChunks cfg.IndexDir)
+                    | None -> Error "Index is up to date but no persisted index was found. Run `knowledge-sight index` again."
+                else
+                    CliOutput.info "  Changed: %d, Unchanged: %d, Removed: %d" changed.Length unchanged.Length removed.Length
+                    let unchangedSet = Set.ofArray unchanged
 
-                let cachedSourceChunks =
-                    match IndexStore.loadSourceChunks cfg.IndexDir with
-                    | Some cached ->
-                        cached
-                        |> Array.filter (fun chunk -> unchangedSet.Contains(Path.GetRelativePath(repo, chunk.FilePath)))
-                    | None -> [||]
+                    let changedAbs = changed |> Array.map (fun rel -> Map.find rel relToAbs)
+                    CliOutput.info "▶ Parsing %d changed files..." changed.Length
+                    let newChunks, newLinks, newFrontmatters = MarkdownChunker.chunkAll changedAbs repo
+                    CliOutput.info "  %d chunks, %d links from changed files" newChunks.Length newLinks.Length
 
-                let allSourceChunks = Array.append cachedSourceChunks newChunks
-                let existingIndex = IndexStore.load cfg.IndexDir
+                    let cachedSourceChunks =
+                        match IndexStore.loadSourceChunks cfg.IndexDir with
+                        | Some cached ->
+                            cached
+                            |> Array.filter (fun chunk -> unchangedSet.Contains(Path.GetRelativePath(repo, chunk.FilePath)))
+                        | None -> [||]
 
-                let oldChunks =
-                    match existingIndex with
-                    | Some index ->
-                        index.Chunks
-                        |> Array.filter (fun chunk -> unchangedSet.Contains(Path.GetRelativePath(repo, chunk.FilePath)))
-                    | None -> [||]
+                    let allSourceChunks = Array.append cachedSourceChunks newChunks
+                    let existingIndex = IndexStore.load cfg.IndexDir
 
-                let oldEmbeddings =
-                    match existingIndex with
-                    | Some index ->
-                        index.Chunks
-                        |> Array.indexed
-                        |> Array.filter (fun (_, chunk) -> unchangedSet.Contains(Path.GetRelativePath(repo, chunk.FilePath)))
-                        |> Array.map (fun (i, _) -> if i < index.Embeddings.Length then index.Embeddings.[i] else [||])
-                    | None -> [||]
+                    let oldChunks =
+                        match existingIndex with
+                        | Some index ->
+                            index.Chunks
+                            |> Array.filter (fun chunk -> unchangedSet.Contains(Path.GetRelativePath(repo, chunk.FilePath)))
+                        | None -> [||]
 
-                let oldLinks =
-                    match existingIndex with
-                    | Some index ->
-                        index.Links
-                        |> Array.filter (fun link -> unchangedSet.Contains(Path.GetRelativePath(repo, link.SourceFile)))
-                    | None -> [||]
+                    let oldEmbeddings =
+                        match existingIndex with
+                        | Some index ->
+                            index.Chunks
+                            |> Array.indexed
+                            |> Array.filter (fun (_, chunk) -> unchangedSet.Contains(Path.GetRelativePath(repo, chunk.FilePath)))
+                            |> Array.map (fun (i, _) -> if i < index.Embeddings.Length then index.Embeddings.[i] else [||])
+                        | None -> [||]
 
-                let oldFrontmatters =
-                    match existingIndex with
-                    | Some index ->
-                        index.Frontmatters
-                        |> Map.filter (fun path _ -> unchangedSet.Contains(Path.GetRelativePath(repo, path)))
-                    | None -> Map.empty
+                    let oldLinks =
+                        match existingIndex with
+                        | Some index ->
+                            index.Links
+                            |> Array.filter (fun link -> unchangedSet.Contains(Path.GetRelativePath(repo, link.SourceFile)))
+                        | None -> [||]
 
-                let newEntries =
-                    newChunks
-                    |> Array.map (fun chunk ->
+                    let oldFrontmatters =
+                        match existingIndex with
+                        | Some index ->
+                            index.Frontmatters
+                            |> Map.filter (fun path _ -> unchangedSet.Contains(Path.GetRelativePath(repo, path)))
+                        | None -> Map.empty
+
+                    let newEntries =
+                        newChunks
+                        |> Array.map (fun chunk ->
+                            {
+                                FilePath = chunk.FilePath
+                                Heading = chunk.Heading
+                                HeadingPath = chunk.HeadingPath
+                                Level = chunk.Level
+                                StartLine = chunk.StartLine
+                                EndLine = chunk.EndLine
+                                Summary = chunk.Summary
+                                Tags = chunk.Tags |> String.concat ","
+                                LinkCount = chunk.OutLinks.Length
+                                WordCount = chunk.Content.Split([| ' '; '\n'; '\t' |], StringSplitOptions.RemoveEmptyEntries).Length
+                            })
+
+                    let allEntries = Array.append oldChunks newEntries
+                    let allLinks = Array.append oldLinks newLinks
+                    let allFrontmatters = Map.fold (fun acc key value -> Map.add key value acc) oldFrontmatters newFrontmatters
+
+                    CliOutput.info "▶ Embedding %d new chunks..." newEntries.Length
+                    let textsToEmbed =
+                        newChunks
+                        |> Array.map (fun chunk ->
+                            let summaryOrContent =
+                                if chunk.Summary <> "(no summary)" then chunk.Summary
+                                else chunk.Content.Substring(0, min 200 chunk.Content.Length)
+                            sprintf "search_document: %s\n%s" chunk.HeadingPath summaryOrContent)
+
+                    let newEmbeddings =
+                        if textsToEmbed.Length = 0 then
+                            [||]
+                        else
+                            textsToEmbed
+                            |> Array.chunkBySize cfg.EmbeddingBatchSize
+                            |> Array.collect (fun batch ->
+                                CliOutput.info "  Embedding batch of %d..." batch.Length
+                                match EmbeddingService.embed cfg.EmbeddingUrl batch |> Async.AwaitTask |> Async.RunSynchronously with
+                                | Ok embeddings -> embeddings
+                                | Error message ->
+                                    eprintfn "  ⚠ Embedding failed — %s. Using zero vectors." message
+                                    Array.init batch.Length (fun _ -> [||]))
+
+                    let allEmbeddings = Array.append oldEmbeddings newEmbeddings
+                    let dim =
+                        if allEmbeddings.Length > 0 && allEmbeddings.[0].Length > 0 then allEmbeddings.[0].Length
+                        else 0
+
+                    let index =
                         {
-                            FilePath = chunk.FilePath
-                            Heading = chunk.Heading
-                            HeadingPath = chunk.HeadingPath
-                            Level = chunk.Level
-                            StartLine = chunk.StartLine
-                            EndLine = chunk.EndLine
-                            Summary = chunk.Summary
-                            Tags = chunk.Tags |> String.concat ","
-                            LinkCount = chunk.OutLinks.Length
-                            WordCount = chunk.Content.Split([| ' '; '\n'; '\t' |], StringSplitOptions.RemoveEmptyEntries).Length
-                        })
+                            Chunks = allEntries
+                            Embeddings = allEmbeddings
+                            Links = allLinks
+                            Frontmatters = allFrontmatters
+                            EmbeddingDim = dim
+                        }
 
-                let allEntries = Array.append oldChunks newEntries
-                let allLinks = Array.append oldLinks newLinks
-                let allFrontmatters = Map.fold (fun acc key value -> Map.add key value acc) oldFrontmatters newFrontmatters
+                    IndexStore.save cfg.IndexDir index
+                    IndexStore.saveSourceChunks cfg.IndexDir allSourceChunks
 
-                eprintfn "▶ Embedding %d new chunks..." newEntries.Length
-                let textsToEmbed =
-                    newChunks
-                    |> Array.map (fun chunk ->
-                        let summaryOrContent =
-                            if chunk.Summary <> "(no summary)" then chunk.Summary
-                            else chunk.Content.Substring(0, min 200 chunk.Content.Length)
-                        sprintf "search_document: %s\n%s" chunk.HeadingPath summaryOrContent)
+                    ensureIndexDir cfg.IndexDir
+                    FileHashing.saveHashes hashesPath (currentHashes |> Map.filter (fun path _ -> not (Set.contains path (Set.ofArray removed))))
 
-                let newEmbeddings =
-                    if textsToEmbed.Length = 0 then
-                        [||]
-                    else
-                        textsToEmbed
-                        |> Array.chunkBySize cfg.EmbeddingBatchSize
-                        |> Array.collect (fun batch ->
-                            eprintfn "  Embedding batch of %d..." batch.Length
-                            match EmbeddingService.embed cfg.EmbeddingUrl batch |> Async.AwaitTask |> Async.RunSynchronously with
-                            | Ok embeddings -> embeddings
-                            | Error message ->
-                                eprintfn "  ⚠ Embedding failed — %s. Using zero vectors." message
-                                Array.init batch.Length (fun _ -> [||]))
+                    CliOutput.info "✓ Index complete: %d chunks, %d links, %d docs with frontmatter, dim=%d"
+                        allEntries.Length allLinks.Length allFrontmatters.Count dim
 
-                let allEmbeddings = Array.append oldEmbeddings newEmbeddings
-                let dim =
-                    if allEmbeddings.Length > 0 && allEmbeddings.[0].Length > 0 then allEmbeddings.[0].Length
-                    else 0
-
-                let index =
-                    {
-                        Chunks = allEntries
-                        Embeddings = allEmbeddings
-                        Links = allLinks
-                        Frontmatters = allFrontmatters
-                        EmbeddingDim = dim
-                    }
-
-                IndexStore.save cfg.IndexDir index
-                IndexStore.saveSourceChunks cfg.IndexDir allSourceChunks
-
-                ensureIndexDir cfg.IndexDir
-                FileHashing.saveHashes hashesPath (currentHashes |> Map.filter (fun path _ -> not (Set.contains path (Set.ofArray removed))))
-
-                eprintfn "✓ Index complete: %d chunks, %d links, %d docs with frontmatter, dim=%d"
-                    allEntries.Length allLinks.Length allFrontmatters.Count dim
-
-                Ok (index, Some allSourceChunks)
+                    Ok (index, Some allSourceChunks)

@@ -103,11 +103,11 @@ let printUsage () =
     printfn "AITeam.KnowledgeSight — knowledge/doc intelligence for any repo"
     printfn ""
     printfn "Usage:"
-    printfn "  knowledge-sight index [--repo <path>]                Build/update index"
+    printfn "  knowledge-sight index [--quiet] [--repo <path>]      Build/update index"
     printfn "  knowledge-sight catalog [--repo <path>]              Show topic map"
-    printfn "  knowledge-sight search <js> [--json] [--repo <path>]  Run a query"
-    printfn "  knowledge-sight eval <js> [--json] [--repo <path>]    Alias for search"
-    printfn "  knowledge-sight eval - [--json] [--repo <path>]       Read expression from stdin"
+    printfn "  knowledge-sight search <js> [--json] [--quiet] [--repo <path>]  Run a query"
+    printfn "  knowledge-sight eval <js> [--json] [--quiet] [--repo <path>]    Alias for search"
+    printfn "  knowledge-sight eval - [--json] [--quiet] [--repo <path>]       Read expression from stdin"
     printfn "  knowledge-sight repl [--repo <path>]                   Interactive mode"
     printfn "  knowledge-sight orphans [--repo <path>]              Find unlinked docs"
     printfn "  knowledge-sight broken [--repo <path>]               Find broken links"
@@ -120,6 +120,9 @@ let printUsage () =
     printfn "  knowledge-sight fn list [--verbose] [--json]         List saved functions"
     printfn "  knowledge-sight fn rm <name> [--repo <path>]         Remove a function"
     printfn "  knowledge-sight --help                               Show this help"
+    printfn ""
+    printfn "Global option:"
+    printfn "  --quiet                              Suppress informational stderr diagnostics; warnings/errors stay visible"
     printfn ""
     printfn "Functions:"
     printfn "  Save chains of primitives as reusable functions. Example:"
@@ -159,7 +162,7 @@ let printUsage () =
     printfn "  dispose(ref, {action, ...})          Promote, merge, or reject one inbox item"
     printfn "  supersede(ref, text, {reason, ...})  Replace one active canonical doc with a versioned sibling"
     printfn "  reverify({scope, apply})             Re-run deterministic verify expressions (scope: exact file / dir / glob; apply:true marks drifting active docs stale)"
-    printfn "  conflicts({scope, threshold, pairs, judge, verdicts, rollup, profile, profiles, duplicatesOnly, hasConflict, mixedVerdicts, compatibleOnly, conflictOnly, noConflict}) Surface unjudged/judged pending+active similarity candidates (filtered judged output keeps returned pairs/rollup/profile aligned on the same visible pair set; supports exact visible profile/profile-set filtering on the judged rollup seam, verdicts-first recomputation, zero-retained omission, the existing bounded candidate-gate/profile lifts, and explicit semantic-unavailability errors when matched docs lack persisted conflict anchors)"
+    printfn "  conflicts({scope, threshold})         Surface pending+active similarity candidates (core surface); add {pairs:true, judge:true} for judged pairs, advanced filter knobs remain compatibility-only"
     printfn "  prune({scope, olderThanDays, apply}) Preview prune candidates by default; apply:true deletes only initially eligible stale/superseded/deprecated canonical docs"
     printfn "  cluster(dir, {threshold, status})    Cluster docs by similarity"
     printfn "  gaps({scope, min_docs, signal})      Find coverage gaps"
@@ -181,6 +184,7 @@ let parseArgs (args: string[]) =
     let mutable command = ""
     let mutable verbose = false
     let mutable jsonOut = false
+    let mutable quiet = false
     let mutable query = ""
     let mutable fnName = ""
     let mutable fnParams = ""
@@ -196,6 +200,9 @@ let parseArgs (args: string[]) =
         | "--repo" when i + 1 < args.Length ->
             repo <- args.[i + 1]
             i <- i + 2
+        | "--quiet" ->
+            quiet <- true
+            i <- i + 1
         | "--help" | "-h" ->
             command <- "help"
             i <- i + 1
@@ -220,6 +227,9 @@ let parseArgs (args: string[]) =
                     | "--file" when i + 1 < args.Length ->
                         fnFile <- args.[i + 1]
                         i <- i + 2
+                    | "--quiet" ->
+                        quiet <- true
+                        i <- i + 1
                     | "--repo" when i + 1 < args.Length ->
                         repo <- args.[i + 1]
                         i <- i + 2
@@ -234,6 +244,7 @@ let parseArgs (args: string[]) =
                     match args.[i] with
                     | "--verbose" | "-v" -> verbose <- true; i <- i + 1
                     | "--json" -> jsonOut <- true; i <- i + 1
+                    | "--quiet" -> quiet <- true; i <- i + 1
                     | "--repo" when i + 1 < args.Length -> repo <- args.[i + 1]; i <- i + 2
                     | _ -> i <- i + 1
             | "rm" when i + 2 < args.Length ->
@@ -250,6 +261,7 @@ let parseArgs (args: string[]) =
             while i < args.Length do
                 match args.[i] with
                 | "--expr" -> exprMode <- true; i <- i + 1
+                | "--quiet" -> quiet <- true; i <- i + 1
                 | "--repo" when i + 1 < args.Length -> repo <- args.[i + 1]; i <- i + 2
                 | _ -> i <- i + 1
         | "search" | "eval" when i + 1 < args.Length ->
@@ -259,6 +271,7 @@ let parseArgs (args: string[]) =
             while i < args.Length do
                 match args.[i] with
                 | "--json" -> jsonOut <- true; i <- i + 1
+                | "--quiet" -> quiet <- true; i <- i + 1
                 | "--repo" when i + 1 < args.Length -> repo <- args.[i + 1]; i <- i + 2
                 | _ -> i <- i + 1
         | "--changed" when command = "health" ->
@@ -277,14 +290,17 @@ let parseArgs (args: string[]) =
             query <- s
             i <- i + 1
         | _ -> i <- i + 1
-    repo, command, query, fnName, fnParams, fnDesc, fnFile, verbose, jsonOut, exprMode, healthChanged, healthSince, healthLimit
+    repo, command, query, fnName, fnParams, fnDesc, fnFile, verbose, jsonOut, quiet, exprMode, healthChanged, healthSince, healthLimit
 
 [<EntryPoint>]
 let main args =
+    CliOutput.setQuiet false
+
     if args.Length = 0 then printUsage(); 0
     else
 
-    let repo, command, query, fnName, fnParams, fnDesc, fnFile, verbose, jsonOut, exprMode, healthChanged, healthSince, healthLimit = parseArgs args
+    let repo, command, query, fnName, fnParams, fnDesc, fnFile, verbose, jsonOut, quiet, exprMode, healthChanged, healthSince, healthLimit = parseArgs args
+    CliOutput.setQuiet quiet
 
     if command = "help" then printUsage(); 0
     else

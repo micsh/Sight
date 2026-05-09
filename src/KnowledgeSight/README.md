@@ -46,10 +46,10 @@ The tool expects a local embedding server at `http://localhost:1234/v1/embedding
 
 | Command | Description |
 |---------|-------------|
-| `index [--repo <path>]` | Build or incrementally update the doc index |
+| `index [--quiet] [--repo <path>]` | Build or incrementally update the doc index |
 | `catalog [--repo <path>]` | Show a topic map of all indexed docs |
-| `search <expr> [--repo <path>]` | Run a query expression |
-| `eval <expr> [--repo <path>]` | Alias for `search` (semantic clarity for non-search expressions) |
+| `search <expr> [--json] [--quiet] [--repo <path>]` | Run a query expression |
+| `eval <expr> [--json] [--quiet] [--repo <path>]` | Alias for `search` (semantic clarity for non-search expressions) |
 | `repl [--repo <path>]` | Interactive REPL for queries |
 | `orphans [--repo <path>]` | Find docs with no incoming links |
 | `broken [--repo <path>]` | Find broken links across docs |
@@ -60,6 +60,10 @@ The tool expects a local embedding server at `http://localhost:1234/v1/embedding
 | `fn list [--repo <path>]` | List saved functions |
 | `fn rm <name> [--repo <path>]` | Remove a function |
 | `--help` | Show help |
+
+Use `--quiet` when a `--json` workflow needs clean combined-stream output. It suppresses
+informational stderr diagnostics (progress / execution-truth markers) but still leaves real
+warnings and errors on stderr.
 
 ## Query Language
 
@@ -128,7 +132,7 @@ mergeBy('id', search('auth'), grep('authentication'))
 | `dispose(refId, {action, ...})` | Promote, merge, or reject one inbox item |
 | `supersede(refId, newContent, {reason, by, verify})` | Replace one active canonical doc with a versioned sibling while preserving the old doc for audit |
 | `reverify({scope, apply})` | Verify recheck for active canonical docs (`scope` is default-all or stable repo-relative canonical selectors: exact file, dir, glob; `apply:true` only marks drifting active docs stale) |
-| `conflicts({scope, threshold, pairs, judge, verdicts, rollup, profile, profiles, duplicatesOnly, hasConflict, mixedVerdicts, compatibleOnly, conflictOnly, noConflict})` | Read-only similarity candidates across pending inbox + active canonical docs |
+| `conflicts({scope, threshold})` | Read-only similarity candidates across pending inbox + active canonical docs (core surface; add `{pairs:true, judge:true}` for judged pairs; advanced filters remain compatibility-only) |
 | `prune({scope, olderThanDays, apply})` | Preview prune candidates by default; `apply:true` deletes only initially eligible `stale` / `superseded` / `deprecated` canonical docs |
 | `cluster(dir, {threshold, status})` | Cluster docs by similarity |
 | `gaps({scope, min_docs, signal})` | Find coverage gaps |
@@ -183,8 +187,9 @@ protected-genre controls intact.
 
 When you run compaction mode with `--json`, stdout remains a pure JSON finding array. Execution truth
 for the fast path (profile applied, bounded work, bypassed broad stages, shortlist counts) is emitted
-on stderr as `[hygiene/compaction] ...` markers so machine verifiers can prove deployment/work
-budgeting without polluting JSON rows.
+on stderr as `[hygiene/compaction] ...` markers by default so machine verifiers can prove
+deployment/work budgeting without polluting JSON rows. Add `--quiet` only when you need clean
+combined-stream JSON; warnings/errors still stay on stderr.
 
 For habitual edit-loop use, the ambient surface is `knowledge-sight health --changed`. It keeps plain
 `health` unchanged, scopes compaction hints to changed/current docs first (or an explicit `--since`
@@ -330,12 +335,16 @@ All fields are optional. Defaults:
 
 `inboxDir` participates in index scans for the minimal v1 bus loop even when `docDirs` is configured as
 canonical-only (for example `["docs"]`). That keeps filed inbox claims visible to `triage()` /
-`dispose()` without requiring callers to mirror `inboxDir` into `docDirs`.
+`dispose()` without requiring callers to mirror `inboxDir` into `docDirs`. If a repo already keeps inbox
+content under a configured doc dir (for example `knowledge-base/inbox`), set `inboxDir` to that explicit
+repo-relative path; bare `inboxDir:"inbox"` stays repo-root and now errors when the repo layout makes the
+intended inbox root ambiguous.
 
 `requireFieldsMode: "warn"` (default) files novel chunks and returns advisory `warnings` for missing
 required fields. `requireFieldsMode: "error"` keeps the same default/known/paragraph-by-paragraph behavior,
 but refuses novel chunks missing configured required fields before inbox write/indexing while still
-returning advisory `warnings` and `suggestedVerify` when available.
+returning advisory `warnings` and `suggestedVerify` when a ranked placement candidate exposes persisted
+`related` evidence.
 
 `completionUrl` and `conflictJudgeModel` are only needed for the bounded judged conflicts-pairs path:
 `conflicts({pairs:true, judge:true})`, including optional deterministic `verdicts:[...]` filtering and
@@ -352,7 +361,8 @@ deterministic on top of that shipped judged-pair path and do not add extra compl
 
 The bounded write loop now ships four disposition surfaces:
 
-- `propose()` files novel chunks into `inbox/{team}/`; `requireFieldsMode: "warn"` keeps warning-only behavior, while `requireFieldsMode: "error"` blocks novel chunks missing configured required fields before inbox write
+- `propose()` files novel chunks into `inbox/{team}/`; `cycle` accepts either the existing filename-safe UTC form or a non-negative integer id (stored as a canonical decimal string), integer cycles keep blank `triage()` age because they are ids rather than timestamps, mixed-form `triage()` lists group UTC rows before integer rows, and `triage({before:...})` now bounded-errors on mixed UTC/integer inboxes instead of silently paging only one form; `requireFieldsMode: "warn"` keeps warning-only behavior while `requireFieldsMode: "error"` blocks novel chunks missing configured required fields before inbox write
+- the propose intake gate stays bounded: terse declarative/prescriptive short claims can still file, while clearly hedged/musing short text still returns `blocked`
 - `triage()` lists pending inbox items with `missing` metadata
 - `dispose(..., {action:'promote'|'merge'|'reject'})` closes the curator loop
 - `merge` is now hardened: explicit targets canonicalize under repo/doc-dir containment, inbox/non-canonical targets are rejected before write, retries dedupe by deterministic merge identity, and concurrent canonical edits fail with conflict instead of clobbering
@@ -372,7 +382,7 @@ The bounded `reverify()` foundation remains the active verification boundary:
 
 The bounded `conflicts()` candidate surface is now available as a read-only curator check:
 
-- `conflicts({scope, threshold, pairs, judge, verdicts, rollup, profile, profiles, duplicatesOnly, hasConflict, mixedVerdicts, compatibleOnly, conflictOnly, noConflict})` defaults to pending inbox docs plus active canonical docs
+- `conflicts({scope, threshold})` is the compact advertised core and defaults to pending inbox docs plus active canonical docs
 - it reuses persisted index embeddings / clustering internals only; no live query embeddings or completion calls
 - if indexed docs resolve on read surfaces but the selected conflicts scope has zero usable persisted semantic anchors, `conflicts()` now errors explicitly for semantic unavailability instead of misreporting a scope selector no-match
 - default `conflicts()` and `conflicts({pairs:true})` remain unjudged; judged annotations are opt-in only on derived pairs
@@ -381,6 +391,7 @@ The bounded `conflicts()` candidate surface is now available as a read-only cura
 - selector validation is all-or-nothing: any selector touching unsupported docs or matching zero supported docs bounded-errors the call instead of partial-succeeding
 - `judge:true` is supported only with `pairs:true`; `conflicts({judge:true})` bounded-errors to avoid ambiguous cluster-level verdicts
 - judged pairs require configured `completionUrl` + `conflictJudgeModel`, run after deterministic pair derivation, and bounded-error the whole call on timeout/transport/schema failures
+- advanced judged-filter knobs such as `verdicts`, `profile` / `profiles`, and the existing candidate-gate booleans (`duplicatesOnly`, `hasConflict`, `mixedVerdicts`, `compatibleOnly`, `conflictOnly`, `noConflict`) remain supported for compatibility in this wave; the help surface is smaller, but the parser/semantics are intentionally unchanged
 - optional `verdicts:[...]` is supported only with `pairs:true, judge:true`; it filters the visible judged `pairs` array to the retained verdict set, omits candidates whose retained visible pair set is empty, and never makes extra completion calls
 - optional `rollup:true` is supported only with `pairs:true, judge:true`; it additively summarizes deterministic facts from that same visible retained judged pair set only (including `judgedPairs`, `verdictCounts`, `mixedVerdicts`, explicit predicate booleans `duplicateOnly`, `hasConflict`, `compatibleOnly`, `conflictOnly`, and `noConflict`, plus one additive `profile` label: `duplicateOnly`, `compatibleOnly`, `conflictOnly`, `noConflictMixed`, or `mixedWithConflict`) so returned `pairs`, returned `rollup`, and additive `profile` stay aligned, and it never makes extra completion calls
 - optional `profile:'...'` is supported only with `pairs:true, judge:true, rollup:true`; omission still preserves the shipped path only when the `profile` key is absent, while explicit blank / null / unsupported values bounded-error with no trimming / case-folding / aliases. When present, it retains only candidates whose current visible rollup `profile` exactly matches one supported label (`duplicateOnly`, `compatibleOnly`, `conflictOnly`, `noConflictMixed`, or `mixedWithConflict`). If `verdicts:[...]` is also present, `verdicts:[...]` runs first, visible `rollup` / `profile` recompute from that same retained visible pair set only, zero-retained-pair omission stays as shipped, and only then does the exact profile match run. Outside the bounded lifts below, candidate-gate combinations with `profile:'...'` still reject. In one bounded lift, `conflicts({pairs:true, judge:true, rollup:true, noConflict:true, profile:'noConflictMixed'})` is accepted only when the `verdicts` key is absent: full-set `noConflict:true` retention still runs first, then current visible full-set rollup `profile` membership keeps only retained `profile='noConflictMixed'` candidates, unanimous duplicate-only / compatible-only no-conflict candidates are excluded without hidden verdict filtering, and conflict-bearing candidates stay excluded before profile membership. In another bounded lift, `conflicts({pairs:true, judge:true, rollup:true, hasConflict:true, profile:'mixedWithConflict'})` is accepted only when the `verdicts` key is absent: full-set `hasConflict:true` retention still runs first, then current visible full-set rollup `profile` membership keeps only retained `profile='mixedWithConflict'` candidates, conflict-only candidates are excluded without hidden verdict filtering, and every other `hasConflict:true + profile:'...'` input still rejects. In another bounded lift, `conflicts({pairs:true, judge:true, rollup:true, mixedVerdicts:true, profile:'mixedWithConflict'})` is accepted only when the `verdicts` key is absent: full-set `mixedVerdicts:true` retention still runs first, then current visible full-set rollup `profile` membership keeps only retained `profile='mixedWithConflict'` candidates, retained `profile='noConflictMixed'` candidates and conflict-only candidates are excluded without hidden verdict filtering, and every other `mixedVerdicts:true + profile:'...'` input still rejects. In another bounded lift, `conflicts({pairs:true, judge:true, rollup:true, conflictOnly:true, profile:'conflictOnly'})` is accepted only when the `verdicts` key is absent: full-set `conflictOnly:true` retention still runs first, then current visible full-set rollup `profile` membership keeps only retained `profile='conflictOnly'` candidates, mixed conflict-bearing and no-conflict candidates are excluded before profile membership, and every other `conflictOnly:true + profile:'...'` input still rejects. In another bounded lift, `conflicts({pairs:true, judge:true, rollup:true, duplicatesOnly:true, profile:'duplicateOnly'})` is accepted only when the `verdicts` key is absent: full-set `duplicatesOnly:true` retention still runs first, then current visible full-set rollup `profile` membership keeps only retained `profile='duplicateOnly'` candidates, mixed conflict-bearing and no-conflict candidates are excluded before profile membership, and every other `duplicatesOnly:true + profile:'...'` input still rejects. In another bounded lift, `conflicts({pairs:true, judge:true, rollup:true, compatibleOnly:true, profile:'compatibleOnly'})` is accepted only when the `verdicts` key is absent: full-set `compatibleOnly:true` retention still runs first, then current visible full-set rollup `profile` membership keeps only retained `profile='compatibleOnly'` candidates, mixed conflict-bearing and no-conflict candidates are excluded before profile membership, and every other `compatibleOnly:true + profile:'...'` input still rejects

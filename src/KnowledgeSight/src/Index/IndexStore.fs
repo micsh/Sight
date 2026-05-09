@@ -139,7 +139,7 @@ module IndexStore =
                 content = c.Content; summary = c.Summary
                 tags = c.Tags; outLinks = c.OutLinks |})
             writer.WriteLine(json)
-        eprintfn "  Cached %d source chunks → source-chunks.jsonl" chunks.Length
+        CliOutput.info "  Cached %d source chunks → source-chunks.jsonl" chunks.Length
 
     let loadSourceChunks (dir: string) : DocChunk[] option =
         let path = Path.Combine(dir, "source-chunks.jsonl")
@@ -217,7 +217,7 @@ module IndexStore =
         // Save frontmatters
         saveFrontmatters dir index.Frontmatters
 
-        eprintfn "  Index saved: %d chunks, %d links, %d docs with frontmatter → %s"
+        CliOutput.info "  Index saved: %d chunks, %d links, %d docs with frontmatter → %s"
             index.Chunks.Length index.Links.Length index.Frontmatters.Count dir
 
     let load (dir: string) : DocIndex option =

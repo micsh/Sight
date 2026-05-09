@@ -246,6 +246,63 @@ cycle: "2026-05-07T00-01-00Z"
         (getRequiredProperty "error" element[0]).GetString()
 
     [<Fact>]
+    let ``help advertises a compact conflicts core surface`` () =
+        let originalOut = Console.Out
+        use writer = new StringWriter()
+
+        try
+            Console.SetOut(writer)
+            Program.printUsage()
+        finally
+            Console.SetOut(originalOut)
+
+        let output = writer.ToString()
+        Assert.Contains("conflicts({scope, threshold})", output)
+        Assert.Contains("{pairs:true, judge:true}", output)
+        Assert.Contains("compatibility-only", output)
+        Assert.DoesNotContain(
+            "conflicts({scope, threshold, pairs, judge, verdicts, rollup, profile, profiles, duplicatesOnly, hasConflict, mixedVerdicts, compatibleOnly, conflictOnly, noConflict})",
+            output)
+
+    [<Fact>]
+    let ``advanced conflicts filters remain supported on the compatibility surface`` () =
+        use harness = ConflictHarness.Create()
+        use doc =
+            JsonDocument.Parse(
+                harness.EvalJson(
+                    "conflicts({scope:['docs/canon/active-alpha.md','inbox/ops/2026-05-07T00-00-00Z-pending-gamma.md'], pairs:true, judge:true, rollup:true, conflictOnly:true})"))
+
+        let results = doc.RootElement
+        Assert.Equal(JsonValueKind.Array, results.ValueKind)
+        Assert.Equal(1, results.GetArrayLength())
+
+        let candidate = results[0]
+        let pairs = getRequiredProperty "pairs" candidate
+        let rollup = getRequiredProperty "rollup" candidate
+        let verdictCounts = getRequiredProperty "verdictCounts" rollup
+
+        let signatures =
+            pairs.EnumerateArray()
+            |> Seq.map pairSignature
+            |> Seq.toArray
+
+        Assert.Equal<string[]>(
+            [|
+                "docs/canon/active-alpha.md|inbox/ops/2026-05-07T00-00-00Z-pending-gamma.md"
+            |],
+            signatures)
+
+        Assert.Equal(1, pairs.GetArrayLength())
+        Assert.Equal(1, (getRequiredProperty "judgedPairs" rollup).GetInt32())
+        Assert.Equal(1, (getRequiredProperty "conflict" verdictCounts).GetInt32())
+        Assert.Equal(0, (getRequiredProperty "duplicate" verdictCounts).GetInt32())
+        Assert.Equal(0, (getRequiredProperty "compatible" verdictCounts).GetInt32())
+        Assert.True((getRequiredProperty "hasConflict" rollup).GetBoolean())
+        Assert.True((getRequiredProperty "conflictOnly" rollup).GetBoolean())
+        Assert.Equal("conflictOnly", (getRequiredProperty "profile" rollup).GetString())
+        Assert.Equal(1, harness.MixedRequestCount)
+
+    [<Fact>]
     let ``bare judged rollup keeps the full visible pair set and rollup aligned`` () =
         use harness = ConflictHarness.Create()
         use doc = JsonDocument.Parse(harness.EvalJson("conflicts({pairs:true, judge:true, rollup:true})"))

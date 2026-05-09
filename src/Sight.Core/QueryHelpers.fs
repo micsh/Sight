@@ -57,6 +57,46 @@ module QueryHelpers =
     let rewriteRefIds (js: string) =
         Regex.Replace(js, @"(?<![""'a-zA-Z_])R(\d+)(?![""'a-zA-Z_])", "'R$1'")
 
+    let private tryFindLastTopLevelSemicolon (js: string) =
+        let mutable lastSemi = -1
+        let mutable inSingleQuoted = false
+        let mutable inDoubleQuoted = false
+        let mutable inTemplateQuoted = false
+        let mutable escapeNext = false
+        let mutable parenDepth = 0
+        let mutable bracketDepth = 0
+        let mutable braceDepth = 0
+
+        for i in 0 .. js.Length - 1 do
+            let ch = js.[i]
+
+            if escapeNext then
+                escapeNext <- false
+            elif inSingleQuoted then
+                if ch = '\\' then escapeNext <- true
+                elif ch = '\'' then inSingleQuoted <- false
+            elif inDoubleQuoted then
+                if ch = '\\' then escapeNext <- true
+                elif ch = '"' then inDoubleQuoted <- false
+            elif inTemplateQuoted then
+                if ch = '\\' then escapeNext <- true
+                elif ch = '`' then inTemplateQuoted <- false
+            else
+                match ch with
+                | '\'' -> inSingleQuoted <- true
+                | '"' -> inDoubleQuoted <- true
+                | '`' -> inTemplateQuoted <- true
+                | '(' -> parenDepth <- parenDepth + 1
+                | ')' when parenDepth > 0 -> parenDepth <- parenDepth - 1
+                | '[' -> bracketDepth <- bracketDepth + 1
+                | ']' when bracketDepth > 0 -> bracketDepth <- bracketDepth - 1
+                | '{' -> braceDepth <- braceDepth + 1
+                | '}' when braceDepth > 0 -> braceDepth <- braceDepth - 1
+                | ';' when parenDepth = 0 && bracketDepth = 0 && braceDepth = 0 -> lastSemi <- i
+                | _ -> ()
+
+        if lastSemi >= 0 then Some lastSemi else None
+
     /// Wrap JS in an IIFE for evaluation.
     let wrapIIFE (js: string) =
         let refRewritten = rewriteRefIds js
@@ -68,17 +108,17 @@ module QueryHelpers =
         else
             let lines = trimmed.Split('\n') |> Array.map (fun s -> s.Trim()) |> Array.filter (fun s -> s <> "")
             let joined = lines |> String.concat " "
-            let lastSemi = joined.LastIndexOf(';')
-            if lastSemi > 0 && lastSemi < joined.Length - 2 then
+            match tryFindLastTopLevelSemicolon joined with
+            | Some lastSemi when lastSemi > 0 && lastSemi < joined.Length - 2 ->
                 let stmts = joined.Substring(0, lastSemi + 1)
                 let expr = joined.Substring(lastSemi + 1).Trim()
                 if expr.Length > 0 then
                     sprintf "(function() { %s return %s; })()" stmts expr
                 else
                     sprintf "(function() { return %s; })()" joined
-            elif joined.StartsWith("let ") || joined.StartsWith("const ") || joined.StartsWith("var ") then
+            | _ when joined.StartsWith("let ") || joined.StartsWith("const ") || joined.StartsWith("var ") ->
                 sprintf "(function() { %s })()" joined
-            else
+            | _ ->
                 sprintf "(function() { return %s; })()" joined
 
     /// Evaluate JS with IIFE wrapping — human-readable formatted output.
