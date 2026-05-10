@@ -613,6 +613,106 @@ module Primitives =
         && not (hasPattern hedging)
         && (hasPattern prescriptive || hasPattern declarative)
 
+    let private normalizeNoveltyCorpusValue (value: string) =
+        if isNull value then ""
+        else value.Trim().ToLowerInvariant()
+
+    let private tryFindFrontmatterFieldInsensitive (field: string) (frontmatter: Frontmatter) =
+        frontmatterFields frontmatter
+        |> Map.toSeq
+        |> Seq.tryPick (fun (candidateField, candidateValue) ->
+            if String.Equals(candidateField, field, StringComparison.OrdinalIgnoreCase) then Some candidateValue
+            else None)
+
+    let private matchesNoveltyCorpusFrontmatterRule (expected: FrontmatterValue) (actual: FrontmatterValue) =
+        match expected, actual with
+        | Scalar expectedValue, Scalar actualValue ->
+            normalizeNoveltyCorpusValue actualValue = normalizeNoveltyCorpusValue expectedValue
+        | Scalar expectedValue, StringList actualValues ->
+            let expectedNormalized = normalizeNoveltyCorpusValue expectedValue
+            actualValues
+            |> Array.exists (fun actualValue -> normalizeNoveltyCorpusValue actualValue = expectedNormalized)
+        | StringList expectedValues, StringList actualValues ->
+            let expectedNormalized =
+                expectedValues
+                |> Array.map normalizeNoveltyCorpusValue
+                |> Array.filter (String.IsNullOrWhiteSpace >> not)
+                |> Array.distinct
+
+            if expectedNormalized.Length = 0 then
+                false
+            else
+                let actualNormalized =
+                    actualValues
+                    |> Array.map normalizeNoveltyCorpusValue
+                    |> Array.filter (String.IsNullOrWhiteSpace >> not)
+                    |> Set.ofArray
+
+                expectedNormalized |> Array.forall actualNormalized.Contains
+        | StringList _, Scalar _ -> false
+
+    let private noveltyCorpusExcludesPath (cfg: KnowledgeSightConfig) (path: string) =
+        match cfg.NoveltyCorpus with
+        | Some corpus when corpus.ExcludePaths.Length > 0 ->
+            let repoPath =
+                if String.IsNullOrWhiteSpace(path) then ""
+                elif Path.IsPathRooted(path) then relativeRepoPath cfg.RepoRoot path
+                else path.Replace("\\", "/")
+
+            corpus.ExcludePaths
+            |> Array.exists (fun selector ->
+                let normalizedSelector =
+                    if isNull selector then ""
+                    else
+                        let trimmed = selector.Trim().Replace("\\", "/")
+                        if trimmed.StartsWith("./", StringComparison.Ordinal) then trimmed.Substring(2)
+                        else trimmed
+
+                if String.IsNullOrWhiteSpace(normalizedSelector) then
+                    false
+                else
+                    let builder = StringBuilder("^")
+                    let mutable i = 0
+
+                    while i < normalizedSelector.Length do
+                        match normalizedSelector.[i] with
+                        | '*' when i + 1 < normalizedSelector.Length && normalizedSelector.[i + 1] = '*' ->
+                            if i + 2 < normalizedSelector.Length && normalizedSelector.[i + 2] = '/' then
+                                builder.Append("(?:.*/)?") |> ignore
+                                i <- i + 3
+                            else
+                                builder.Append(".*") |> ignore
+                                i <- i + 2
+                        | '*' ->
+                            builder.Append("[^/]*") |> ignore
+                            i <- i + 1
+                        | '?' ->
+                            builder.Append("[^/]") |> ignore
+                            i <- i + 1
+                        | ch ->
+                            builder.Append(Regex.Escape(string ch)) |> ignore
+                            i <- i + 1
+
+                    builder.Append("$") |> ignore
+                    Regex(builder.ToString(), RegexOptions.IgnoreCase ||| RegexOptions.Compiled).IsMatch(repoPath))
+        | _ -> false
+
+    let private noveltyCorpusExcludesFrontmatter (cfg: KnowledgeSightConfig) (index: DocIndex) (path: string) =
+        match cfg.NoveltyCorpus with
+        | Some corpus when not (Map.isEmpty corpus.ExcludeFrontmatter) ->
+            match index.Frontmatters |> Map.tryFind path with
+            | Some frontmatter ->
+                corpus.ExcludeFrontmatter
+                |> Map.forall (fun field expected ->
+                    frontmatter
+                    |> tryFindFrontmatterFieldInsensitive field
+                    |> Option.exists (matchesNoveltyCorpusFrontmatterRule expected))
+            | None -> false
+        | _ -> false
+
+    let private isNoveltyCorpusEligibleFile (cfg: KnowledgeSightConfig) (index: DocIndex) (path: string) =
+        not (noveltyCorpusExcludesPath cfg path || noveltyCorpusExcludesFrontmatter cfg index path)
+
     /// Split text into paragraphs, embed each, compare to index.
     /// Classifies each paragraph as: off-topic, musing, novel, or covered.
     let novelty (cfg: KnowledgeSightConfig) (index: DocIndex) (embeddingUrl: string) (text: string) (threshold: float) (statuses: string[]) =
@@ -635,7 +735,10 @@ module Primitives =
                     else
                         let hits =
                             IndexStore.search index embeddings.[i] index.Chunks.Length
-                            |> Array.filter (fun (idx, _) -> matchesDocStatus cfg index allowedStatuses index.Chunks.[idx].FilePath)
+                            |> Array.filter (fun (idx, _) ->
+                                let filePath = index.Chunks.[idx].FilePath
+                                matchesDocStatus cfg index allowedStatuses filePath
+                                && isNoveltyCorpusEligibleFile cfg index filePath)
                         let bestScore, bestChunk =
                             if hits.Length > 0 then
                                 let idx, sim = hits.[0]
@@ -662,6 +765,10 @@ module Primitives =
     let private isWriteCanonicalFile (cfg: KnowledgeSightConfig) (index: DocIndex) (path: string) =
         not (isInboxPath cfg path)
         && effectiveDocStatus cfg index path = "active"
+
+    let private isWriteNoveltyCorpusFile (cfg: KnowledgeSightConfig) (index: DocIndex) (path: string) =
+        isWriteCanonicalFile cfg index path
+        && isNoveltyCorpusEligibleFile cfg index path
 
     let private isPendingInboxFile (cfg: KnowledgeSightConfig) (index: DocIndex) (path: string) (frontmatter: Frontmatter) =
         isInboxPath cfg path
@@ -731,8 +838,8 @@ module Primitives =
 
         ranked |> Array.truncate limit
 
-    let private writePipelinePlacement (cfg: KnowledgeSightConfig) (index: DocIndex) (chunks: DocChunk[] option) (embeddingUrl: string) (text: string) (limit: int) =
-        rankedSubsetMatches index chunks embeddingUrl (isWriteCanonicalFile cfg index) text (max 1 (limit * 3))
+    let private writePipelinePlacement (index: DocIndex) (chunks: DocChunk[] option) (embeddingUrl: string) (isEligibleFile: string -> bool) (text: string) (limit: int) =
+        rankedSubsetMatches index chunks embeddingUrl isEligibleFile text (max 1 (limit * 3))
         |> Array.groupBy (fun (i, _) -> index.Chunks.[i].FilePath)
         |> Array.map (fun (filePath, matches) ->
             let bestIndex, bestScore = matches |> Array.maxBy snd
@@ -2215,10 +2322,12 @@ module Primitives =
 
                 for paragraph in paragraphs do
                     let signal = knowledgeSignal paragraph index
-                    let placement = writePipelinePlacement cfg index chunks cfg.EmbeddingUrl paragraph 3
+                    let placement =
+                        writePipelinePlacement index chunks cfg.EmbeddingUrl (isWriteNoveltyCorpusFile cfg index) paragraph 3
                     let placementPaths = placement |> Array.map (fun (filePath, _, _) -> filePath)
                     let suggestedPath = placement |> Array.tryHead |> Option.map (fun (filePath, _, _) -> relativeRepoPath cfg.RepoRoot filePath)
-                    let nearest = rankedSubsetMatches index chunks cfg.EmbeddingUrl (isWriteCanonicalFile cfg index) paragraph 1
+                    let nearest =
+                        rankedSubsetMatches index chunks cfg.EmbeddingUrl (isWriteNoveltyCorpusFile cfg index) paragraph 1
                     let nearestIndex, nearestScore =
                         if nearest.Length > 0 then
                             let i, score = nearest.[0]

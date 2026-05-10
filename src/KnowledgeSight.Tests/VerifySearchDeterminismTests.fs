@@ -6,6 +6,7 @@ open System.Net
 open System.Net.Sockets
 open System.Text
 open System.Text.Json
+open System.Text.Json.Nodes
 open System.Threading
 open System.Threading.Tasks
 open Xunit
@@ -18,18 +19,27 @@ module VerifySearchDeterminismTests =
         Directory.CreateDirectory(Path.GetDirectoryName(filePath)) |> ignore
         File.WriteAllText(filePath, content.TrimStart(), Encoding.UTF8)
 
-    let private writeConfig (repoRoot: string) (embeddingUrl: string) (docDirs: string[]) (inboxDir: string) (requireFieldsMode: string) =
-        let config =
-            {|
-                docDirs = docDirs
-                inboxDir = inboxDir
-                archiveProcessed = true
-                embeddingUrl = embeddingUrl
-                requireFieldsMode = requireFieldsMode
-            |}
+    let private writeConfigWithMutator
+        (repoRoot: string)
+        (embeddingUrl: string)
+        (docDirs: string[])
+        (inboxDir: string)
+        (requireFieldsMode: string)
+        (mutate: JsonObject -> unit)
+        =
+        let config = JsonObject()
+        config["docDirs"] <- JsonSerializer.SerializeToNode(docDirs)
+        config["inboxDir"] <- JsonValue.Create(inboxDir)
+        config["archiveProcessed"] <- JsonValue.Create(true)
+        config["embeddingUrl"] <- JsonValue.Create(embeddingUrl)
+        config["requireFieldsMode"] <- JsonValue.Create(requireFieldsMode)
+        mutate config
 
-        let json = JsonSerializer.Serialize(config, JsonSerializerOptions(WriteIndented = true))
+        let json = config.ToJsonString(JsonSerializerOptions(WriteIndented = true))
         File.WriteAllText(Path.Combine(repoRoot, "knowledge-sight.json"), json)
+
+    let private writeConfig (repoRoot: string) (embeddingUrl: string) (docDirs: string[]) (inboxDir: string) (requireFieldsMode: string) =
+        writeConfigWithMutator repoRoot embeddingUrl docDirs inboxDir requireFieldsMode ignore
 
     let private findFreePort () =
         let listener = new TcpListener(IPAddress.Loopback, 0)
@@ -135,10 +145,13 @@ module VerifySearchDeterminismTests =
             VerifyHarness.CreateWithRequireFieldsMode(docDirs, inboxDir, "warn", seedRepo)
 
         static member CreateWithRequireFieldsMode(docDirs: string[], inboxDir: string, requireFieldsMode: string, seedRepo: string -> unit) =
+            VerifyHarness.CreateWithConfigMutator(docDirs, inboxDir, requireFieldsMode, ignore, seedRepo)
+
+        static member CreateWithConfigMutator(docDirs: string[], inboxDir: string, requireFieldsMode: string, mutate: JsonObject -> unit, seedRepo: string -> unit) =
             let server = EmbeddingServer.Start()
             let repoRoot = Path.Combine(Path.GetTempPath(), sprintf "ks-verify-search-tests-%s" (Guid.NewGuid().ToString("N")))
             Directory.CreateDirectory(repoRoot) |> ignore
-            writeConfig repoRoot server.EmbeddingUrl docDirs inboxDir requireFieldsMode
+            writeConfigWithMutator repoRoot server.EmbeddingUrl docDirs inboxDir requireFieldsMode mutate
             seedRepo repoRoot
 
             let cfg = Config.load repoRoot
@@ -1111,6 +1124,264 @@ source: "canon"
         use triageDoc = JsonDocument.Parse(harness.EvalJson("triage({team:'ops'})"))
         Assert.Equal(JsonValueKind.Array, triageDoc.RootElement.ValueKind)
         Assert.Equal(0, triageDoc.RootElement.GetArrayLength())
+
+    [<Fact>]
+    let ``noveltyCorpus excludePaths scope propose and novelty without scoping search or placement`` () =
+        let planningPath = "docs/_planning/rollback-planning-residue.md"
+        let proposalText = "Rollback runbook ownership should stay explicit before the deploy window for operators."
+
+        let seedRepo repoRoot =
+            writeFile
+                (Path.Combine(repoRoot, planningPath.Replace("/", Path.DirectorySeparatorChar.ToString())))
+                (sprintf """
+---
+title: "Rollback planning residue"
+status: "active"
+source: "ops"
+---
+%s
+""" proposalText)
+
+        let enableNoveltyCorpus (config: JsonObject) =
+            config["noveltyCorpus"] <-
+                JsonSerializer.SerializeToNode(
+                    {| excludePaths = [| "docs/_planning/**" |] |}
+                )
+
+        use defaultHarness = VerifyHarness.Create(seedRepo)
+
+        use defaultProposeDoc =
+            JsonDocument.Parse(
+                defaultHarness.EvalJson(
+                    sprintf "propose(%s, {team:'ops', cycle:'2026-05-10T07-00-00Z'})" (jsStringLiteral proposalText)
+                )
+            )
+
+        let defaultProposeRow = getSingleArrayResult defaultProposeDoc.RootElement
+        Assert.Equal("known", (getRequiredProperty "status" defaultProposeRow).GetString())
+        Assert.Equal(planningPath, (getRequiredProperty "suggestedTarget" defaultProposeRow).GetString())
+
+        use defaultNoveltyDoc =
+            JsonDocument.Parse(
+                defaultHarness.EvalJson(
+                    sprintf "novelty(%s, {threshold:0.9, status:['active']})" (jsStringLiteral proposalText)
+                )
+            )
+
+        let defaultNoveltyRow = getSingleArrayResult defaultNoveltyDoc.RootElement
+        Assert.Equal("covered", (getRequiredProperty "status" defaultNoveltyRow).GetString())
+        Assert.Equal("rollback-planning-residue.md", (getRequiredProperty "nearDoc" defaultNoveltyRow).GetString())
+
+        use scopedHarness =
+            VerifyHarness.CreateWithConfigMutator([| "docs"; "inbox" |], "inbox", "warn", enableNoveltyCorpus, seedRepo)
+
+        use scopedProposeDoc =
+            JsonDocument.Parse(
+                scopedHarness.EvalJson(
+                    sprintf "propose(%s, {team:'ops', cycle:'2026-05-10T07-05-00Z', threshold:0.9})" (jsStringLiteral proposalText)
+                )
+            )
+
+        let scopedProposeRow = getSingleArrayResult scopedProposeDoc.RootElement
+        Assert.Equal("filed", (getRequiredProperty "status" scopedProposeRow).GetString())
+        Assert.Equal("", (getRequiredProperty "suggestedTarget" scopedProposeRow).GetString())
+
+        use scopedNoveltyDoc =
+            JsonDocument.Parse(
+                scopedHarness.EvalJson(
+                    sprintf "novelty(%s, {threshold:0.9, status:['active']})" (jsStringLiteral proposalText)
+                )
+            )
+
+        let scopedNoveltyRow = getSingleArrayResult scopedNoveltyDoc.RootElement
+        Assert.Equal("off-topic", (getRequiredProperty "status" scopedNoveltyRow).GetString())
+        Assert.Equal("", (getRequiredProperty "nearDoc" scopedNoveltyRow).GetString())
+
+        use searchDoc =
+            JsonDocument.Parse(
+                scopedHarness.EvalJson(
+                    sprintf "search('rollback runbook ownership', {limit:1, file:%s, status:['active']})" (jsStringLiteral planningPath)
+                )
+            )
+
+        let searchRow = getSingleArrayResult searchDoc.RootElement
+        Assert.Equal("rollback-planning-residue.md", (getRequiredProperty "file" searchRow).GetString())
+
+        use placementDoc =
+            JsonDocument.Parse(
+                scopedHarness.EvalJson(
+                    sprintf "placement(%s, {limit:3, status:['active']})" (jsStringLiteral proposalText)
+                )
+            )
+
+        Assert.Equal(JsonValueKind.Array, placementDoc.RootElement.ValueKind)
+        Assert.Contains(
+            placementDoc.RootElement.EnumerateArray() |> Seq.map (fun row -> (getRequiredProperty "file" row).GetString()),
+            fun fileName -> String.Equals(fileName, "rollback-planning-residue.md", StringComparison.Ordinal)
+        )
+
+    [<Fact>]
+    let ``noveltyCorpus excludeFrontmatter scalar rules exclude matching docs while canonical docs still suppress`` () =
+        let scratchPath = "docs/0-scratch/operator-scratch-guidance.md"
+        let canonicalPath = "docs/canon/rollback-runbook.md"
+        let proposalText = "Rollback runbook ownership should stay explicit before the deploy window for operators."
+
+        let seedRepo repoRoot =
+            writeFile
+                (Path.Combine(repoRoot, scratchPath.Replace("/", Path.DirectorySeparatorChar.ToString())))
+                (sprintf """
+---
+title: "Operator scratch guidance"
+status: "active"
+source: "ops"
+tags: ["operators", "scratch", "ephemeral"]
+---
+%s
+""" proposalText)
+
+            writeFile
+                (Path.Combine(repoRoot, canonicalPath.Replace("/", Path.DirectorySeparatorChar.ToString())))
+                (sprintf """
+---
+title: "Rollback runbook ownership"
+status: "active"
+source: "canon"
+tags: ["operators", "canon"]
+---
+%s
+""" proposalText)
+
+        let enableNoveltyCorpus (config: JsonObject) =
+            config["noveltyCorpus"] <-
+                JsonSerializer.SerializeToNode(
+                    {|
+                        excludeFrontmatter = {| source = "ops" |}
+                    |}
+                )
+
+        use defaultHarness = VerifyHarness.Create(seedRepo)
+
+        use defaultProposeDoc =
+            JsonDocument.Parse(
+                defaultHarness.EvalJson(
+                    sprintf "propose(%s, {team:'ops', cycle:'2026-05-10T08-00-00Z'})" (jsStringLiteral proposalText)
+                )
+            )
+
+        let defaultProposeRow = getSingleArrayResult defaultProposeDoc.RootElement
+        Assert.Equal("known", (getRequiredProperty "status" defaultProposeRow).GetString())
+        Assert.Equal(scratchPath, (getRequiredProperty "suggestedTarget" defaultProposeRow).GetString())
+
+        use defaultNoveltyDoc =
+            JsonDocument.Parse(
+                defaultHarness.EvalJson(
+                    sprintf "novelty(%s, {threshold:0.9, status:['active']})" (jsStringLiteral proposalText)
+                )
+            )
+
+        Assert.Equal("operator-scratch-guidance.md", (getRequiredProperty "nearDoc" (getSingleArrayResult defaultNoveltyDoc.RootElement)).GetString())
+
+        use scopedHarness =
+            VerifyHarness.CreateWithConfigMutator([| "docs"; "inbox" |], "inbox", "warn", enableNoveltyCorpus, seedRepo)
+
+        use scopedProposeDoc =
+            JsonDocument.Parse(
+                scopedHarness.EvalJson(
+                    sprintf "propose(%s, {team:'ops', cycle:'2026-05-10T08-05-00Z'})" (jsStringLiteral proposalText)
+                )
+            )
+
+        let scopedProposeRow = getSingleArrayResult scopedProposeDoc.RootElement
+        Assert.Equal("known", (getRequiredProperty "status" scopedProposeRow).GetString())
+        Assert.Equal(canonicalPath, (getRequiredProperty "suggestedTarget" scopedProposeRow).GetString())
+
+        use scopedNoveltyDoc =
+            JsonDocument.Parse(
+                scopedHarness.EvalJson(
+                    sprintf "novelty(%s, {threshold:0.9, status:['active']})" (jsStringLiteral proposalText)
+                )
+            )
+
+        let scopedNoveltyRow = getSingleArrayResult scopedNoveltyDoc.RootElement
+        Assert.Equal("covered", (getRequiredProperty "status" scopedNoveltyRow).GetString())
+        Assert.Equal("rollback-runbook.md", (getRequiredProperty "nearDoc" scopedNoveltyRow).GetString())
+
+    [<Fact>]
+    let ``noveltyCorpus excludeFrontmatter list rules use containment rather than full list equality`` () =
+        let scratchPath = "docs/0-scratch/operator-scratch-guidance.md"
+        let canonicalPath = "docs/canon/rollback-runbook.md"
+        let proposalText = "Rollback runbook ownership should stay explicit before the deploy window for operators."
+
+        let seedRepo repoRoot =
+            writeFile
+                (Path.Combine(repoRoot, scratchPath.Replace("/", Path.DirectorySeparatorChar.ToString())))
+                (sprintf """
+---
+title: "Operator scratch guidance"
+status: "active"
+source: "canon"
+tags: ["operators", "scratch", "ephemeral"]
+---
+%s
+""" proposalText)
+
+            writeFile
+                (Path.Combine(repoRoot, canonicalPath.Replace("/", Path.DirectorySeparatorChar.ToString())))
+                (sprintf """
+---
+title: "Rollback runbook ownership"
+status: "active"
+source: "canon"
+tags: ["operators", "canon"]
+---
+%s
+""" proposalText)
+
+        let enableNoveltyCorpus (config: JsonObject) =
+            config["noveltyCorpus"] <-
+                JsonSerializer.SerializeToNode(
+                    {|
+                        excludeFrontmatter = {| tags = [| "scratch"; "operators" |] |}
+                    |}
+                )
+
+        use defaultHarness = VerifyHarness.Create(seedRepo)
+
+        use defaultProposeDoc =
+            JsonDocument.Parse(
+                defaultHarness.EvalJson(
+                    sprintf "propose(%s, {team:'ops', cycle:'2026-05-10T08-10-00Z'})" (jsStringLiteral proposalText)
+                )
+            )
+
+        let defaultProposeRow = getSingleArrayResult defaultProposeDoc.RootElement
+        Assert.Equal("known", (getRequiredProperty "status" defaultProposeRow).GetString())
+        Assert.Equal(scratchPath, (getRequiredProperty "suggestedTarget" defaultProposeRow).GetString())
+
+        use scopedHarness =
+            VerifyHarness.CreateWithConfigMutator([| "docs"; "inbox" |], "inbox", "warn", enableNoveltyCorpus, seedRepo)
+
+        use scopedProposeDoc =
+            JsonDocument.Parse(
+                scopedHarness.EvalJson(
+                    sprintf "propose(%s, {team:'ops', cycle:'2026-05-10T08-15-00Z'})" (jsStringLiteral proposalText)
+                )
+            )
+
+        let scopedProposeRow = getSingleArrayResult scopedProposeDoc.RootElement
+        Assert.Equal("known", (getRequiredProperty "status" scopedProposeRow).GetString())
+        Assert.Equal(canonicalPath, (getRequiredProperty "suggestedTarget" scopedProposeRow).GetString())
+
+        use scopedNoveltyDoc =
+            JsonDocument.Parse(
+                scopedHarness.EvalJson(
+                    sprintf "novelty(%s, {threshold:0.9, status:['active']})" (jsStringLiteral proposalText)
+                )
+            )
+
+        let scopedNoveltyRow = getSingleArrayResult scopedNoveltyDoc.RootElement
+        Assert.Equal("covered", (getRequiredProperty "status" scopedNoveltyRow).GetString())
+        Assert.Equal("rollback-runbook.md", (getRequiredProperty "nearDoc" scopedNoveltyRow).GetString())
 
     [<Fact>]
     let ``propose files terse valid short claims through the propose-only gate`` () =

@@ -18,6 +18,12 @@ type KnowledgeSightConfig = {
     RequireFields: string[]
     RequireFieldsMode: string
     PromoteCollision: string
+    NoveltyCorpus: NoveltyCorpusConfig option
+}
+
+and NoveltyCorpusConfig = {
+    ExcludePaths: string[]
+    ExcludeFrontmatter: Map<string, FrontmatterValue>
 }
 
 module CliOutput =
@@ -92,6 +98,71 @@ module Config =
         if found.Length > 0 then found
         else [| "." |]
 
+    let private strArrFromElement (element: JsonElement) (p: string) d =
+        match element.TryGetProperty(p) with
+        | true, v ->
+            v.EnumerateArray()
+            |> Seq.map (fun x -> x.GetString())
+            |> Seq.filter (isNull >> not)
+            |> Seq.map (fun value -> value.Trim())
+            |> Seq.filter (String.IsNullOrWhiteSpace >> not)
+            |> Seq.toArray
+        | _ -> d
+
+    let private parseNoveltyFrontmatterValue (field: string) (value: JsonElement) =
+        let invalid () =
+            invalidOp (
+                sprintf
+                    "knowledge-sight.json noveltyCorpus.excludeFrontmatter.%s must be a string or string array"
+                    field
+            )
+
+        match value.ValueKind with
+        | JsonValueKind.String ->
+            let scalar = value.GetString()
+            if String.IsNullOrWhiteSpace(scalar) then None
+            else Some (field, Scalar scalar)
+        | JsonValueKind.Array ->
+            let values =
+                value.EnumerateArray()
+                |> Seq.map (fun item ->
+                    if item.ValueKind <> JsonValueKind.String then invalid ()
+                    item.GetString())
+                |> Seq.filter (isNull >> not)
+                |> Seq.map (fun item -> item.Trim())
+                |> Seq.filter (String.IsNullOrWhiteSpace >> not)
+                |> Seq.toArray
+
+            if values.Length = 0 then None
+            else Some (field, StringList values)
+        | _ -> invalid ()
+
+    let private parseNoveltyCorpus (root: JsonElement) =
+        match root.TryGetProperty("noveltyCorpus") with
+        | true, corpusElement ->
+            if corpusElement.ValueKind <> JsonValueKind.Object then
+                invalidOp "knowledge-sight.json noveltyCorpus must be an object"
+
+            let excludeFrontmatter =
+                match corpusElement.TryGetProperty("excludeFrontmatter") with
+                | true, value ->
+                    if value.ValueKind <> JsonValueKind.Object then
+                        invalidOp "knowledge-sight.json noveltyCorpus.excludeFrontmatter must be an object"
+
+                    value.EnumerateObject()
+                    |> Seq.choose (fun property ->
+                        let field = property.Name.Trim()
+                        if String.IsNullOrWhiteSpace(field) then None
+                        else parseNoveltyFrontmatterValue field property.Value)
+                    |> Map.ofSeq
+                | _ -> Map.empty
+
+            Some {
+                ExcludePaths = strArrFromElement corpusElement "excludePaths" [||]
+                ExcludeFrontmatter = excludeFrontmatter
+            }
+        | _ -> None
+
     let load (repoRoot: string) =
         let repoRoot = Path.GetFullPath(repoRoot)
         let configPath = Path.Combine(repoRoot, "knowledge-sight.json")
@@ -104,14 +175,7 @@ module Config =
             let str (p: string) d = match root.TryGetProperty(p) with true, v -> v.GetString() | _ -> d
             let int' (p: string) d = match root.TryGetProperty(p) with true, v -> v.GetInt32() | _ -> d
             let bool' (p: string) d = match root.TryGetProperty(p) with true, v -> v.GetBoolean() | _ -> d
-            let strArr (p: string) d =
-                match root.TryGetProperty(p) with
-                | true, v ->
-                    v.EnumerateArray()
-                    |> Seq.map (fun x -> x.GetString())
-                    |> Seq.filter (isNull >> not)
-                    |> Seq.toArray
-                | _ -> d
+            let strArr (p: string) d = strArrFromElement root p d
             {
                 RepoRoot = repoRoot
                 DocDirs = strArr "docDirs" (detectDocDirs repoRoot)
@@ -126,6 +190,7 @@ module Config =
                 RequireFields = strArr "requireFields" [| "verify"; "concept" |]
                 RequireFieldsMode = str "requireFieldsMode" "warn"
                 PromoteCollision = str "promoteCollision" "suffix"
+                NoveltyCorpus = parseNoveltyCorpus root
             }
         else
             {
@@ -142,6 +207,7 @@ module Config =
                 RequireFields = [| "verify"; "concept" |]
                 RequireFieldsMode = "warn"
                 PromoteCollision = "suffix"
+                NoveltyCorpus = None
             }
 
     let scanDocDirs (cfg: KnowledgeSightConfig) =
